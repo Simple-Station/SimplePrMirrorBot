@@ -3,12 +3,14 @@ use std::path::Path;
 use std::fs;
 use std::thread::sleep;
 use std::time::Duration;
+use git2::{Error, Repository};
 use octocrab::{self, models::pulls::PullRequest, params, Octocrab};
 use serde_yaml::{self};
 use chrono::{DateTime, Days, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use clokwerk::Interval::{self};
 use clokwerk::{Job, Scheduler, TimeUnits};
-use lazy_static;
+
+mod git_utils;
 
 #[allow(dead_code)]
 const COW: &str = "((...))\n( o o )\n \\   / \n  ^_^  ";
@@ -34,7 +36,7 @@ fn main() {
 
     if config.days_between == 0 {
         println!("'days_between' is set to 0, running once then exiting.");
-        run_tasks();
+        mirror_prs(generate_config()); //? Completely circumvents the scheduling and file writing all together.
         return;
     }
 
@@ -81,6 +83,8 @@ fn run_tasks() {
     println!("Running scheduled tasks at {}.", Local::now().to_rfc2822());
     
     mirror_prs(config.clone());
+
+    finalize(config);
 }
 
 #[tokio::main]
@@ -96,10 +100,14 @@ async fn mirror_prs(config: AppConfig) {
     eprintln!("\nDid build\n");
     let octocrab = octocrab.expect("Octocrab failed to build");
 
-    let mut all_prs = get_all_prs(&octocrab, config.clone()).await;
+    let mut all_prs = get_all_prs(&octocrab, &config).await;
 
-    // if 
-    println!("Found {} PRs starting at {} and ending at {}.", all_prs.len(), all_prs.first().unwrap().number, all_prs.last().unwrap().number);
+    if all_prs.is_empty() {
+        println!("No PRs found at all!");
+        return;
+    }
+
+    println!("Found {} PRs starting at {} and ending at {}.", &all_prs.len(), &all_prs.first().unwrap().number, &all_prs.last().unwrap().number);
 
     let date_time_cutoff: DateTime<Utc> = config.date_from_with_time().and_utc();
 
@@ -109,23 +117,57 @@ async fn mirror_prs(config: AppConfig) {
     all_prs.retain(|pr| { if debug { dbg!(pr.number); dbg!(pr.merged_at.unwrap()); dbg!(date_time_cutoff); } pr.merged_at.unwrap() >= date_time_cutoff });
     all_prs.sort_unstable_by_key(|pr| pr.merged_at);
 
+    if all_prs.is_empty() {
+        println!("No PRs found since the cutoff date.");
+        return;
+    }
+
     println!("Filtered down to {} PRs starting at {} and ending at {}.", all_prs.len(), all_prs.first().unwrap().number, all_prs.last().unwrap().number);
 
-    let mut text = String::new();
-    for pr in all_prs.iter() {
-        text += "--------------------------------------\n";
-        text += &format!("Merged pr #{}: {:?}\n", pr.number, pr.title.clone().unwrap());
-        text += &format!("Merged at: {} by a {:?}\n", pr.merged_at.unwrap(), pr.author_association.clone().unwrap());
-        text += &format!("Adds {:#?} lines and removes {:#?} lines\n", pr.additions, pr.deletions);
-        text += &format!("It had {:#?} comments, {:#?} commits and {:#?} changed files\n", pr.comments, pr.commits, pr.changed_files);
-        text += &format!("It was opened at {:#?}\n", pr.created_at.unwrap());
-    }
-    println!("{}", text);
+    let repo = git_utils::ensure_repo(&config).expect("Unable to get or create local repo!");
 
-    finalize(config);
+    for merged_pr in all_prs.iter() {
+        println!("Cherry-picking and pushing PR #{}.", merged_pr.number);
+        match cherry_pick_and_push_pr(&repo, merged_pr.clone(), &config) {
+            Ok(_) => {
+                println!("Cherry-picked and pushed PR #{}.", merged_pr.number);
+            },
+            Err(e) => {
+                eprintln!("Failed to cherry-pick and push PR #{}: {}", merged_pr.number, e);
+            }
+        }
+        git_utils::reset_repo(&repo, &config).expect("Failed to reset repository.");
+    }
+
+    // let mut text = String::new();
+    // for pr in all_prs.iter() {
+    //     text += "--------------------------------------\n";
+    //     text += &format!("Merged pr #{}: {:?}\n", pr.number, pr.title.clone().unwrap());
+    //     text += &format!("Merged at: {} by a {:?}\n", pr.merged_at.unwrap(), pr.author_association.clone().unwrap());
+    //     text += &format!("Adds {:#?} lines and removes {:#?} lines\n", pr.additions, pr.deletions);
+    //     text += &format!("It had {:#?} comments, {:#?} commits and {:#?} changed files\n", pr.comments, pr.commits, pr.changed_files);
+    //     text += &format!("It was opened at {:#?}\n", pr.created_at.unwrap());
+    // }
+    // println!("{}", text);
 }
 
-async fn get_all_prs(octocrab: &Octocrab, config: AppConfig) -> Vec<PullRequest> {
+fn cherry_pick_and_push_pr(repo: &Repository, merged_pr: PullRequest, config: &AppConfig) -> Result<(), Error> {
+    let sha = merged_pr.merge_commit_sha.expect("No merge commit sha found.");
+    let ri = &config.into_repo;
+    let rc = &config.clone_repo;
+    let branch_name = format!("{}-{}-{}-{}-into-{}-{}-{}", rc.owner, rc.name, rc.branch, merged_pr.number, ri.owner, ri.name, ri.branch);
+
+    println!("Creating branch {}.", branch_name);
+    git_utils::create_branch(&repo, &branch_name)?;
+    println!("Cherry-picking commit {}.", sha);
+    git_utils::cherry_pick_commit(&repo, &config, &sha)?;
+    println!("Pushing to remote {}-{}.", config.owned_url, branch_name);
+    git_utils::push_to_remote(&repo, &config)?;
+
+    return Ok(());
+}
+
+async fn get_all_prs(octocrab: &Octocrab, config: &AppConfig) -> Vec<PullRequest> {
     // Returns the first page of all prs.
     let mut page = octocrab.pulls(&config.clone_repo.owner, &config.clone_repo.name).list()
         .base(&config.clone_repo.branch)
@@ -170,15 +212,55 @@ fn generate_config() -> AppConfig {
         else {
             write_to_config(serde_yaml::to_string(&AppConfig::default()).unwrap());
         }
-        panic!("Config file created. Please fill in the necessary information and run the program again.");
+        panic!("Config file {} created. Please fill in the necessary information and run the program again.", FILE_NAME);
     }
 
-    let yaml_contents = fs::read_to_string(FILE_NAME).unwrap();
-    return serde_yaml::from_str(&yaml_contents).unwrap();
+    let yaml_contents = fs::read_to_string(FILE_NAME).expect(&format!("Config file {} was confirmed to exist, but could not be read.\nAre we missing permissions?.", FILE_NAME));
+    return match serde_yaml::from_str(&yaml_contents) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to parse config file: {}", e);
+            request_regenerate_config();
+            panic!();
+        }
+    };
+}
+
+fn request_regenerate_config() {
+    println!("Config file {} is invalid, would you like to regenerate it? (THIS WILL DELETE THE CURRENT FILE) (y/n)", FILE_NAME);
+    let mut input = String::new();
+    match std::io::stdin().read_line(&mut input) {
+        Ok(_) => {
+            if input.trim().to_lowercase() == "y" {
+                input = String::new();
+                println!("Would you like to regenerate the file using a hardcoded template (with documentation) (y), or a default src-exact template (n)?");
+                match std::io::stdin().read_line(&mut input) {
+                    Ok(_) => {
+                        if input.trim().to_lowercase() == "y" {
+                            write_to_config(YAML_TEMPLATE.to_string());
+                        }
+                        else {
+                            write_to_config(serde_yaml::to_string(&AppConfig::default()).unwrap());
+                        }
+                        panic!("Config file {} has been regenerated. Please fill in the necessary information and run the program again.", FILE_NAME);
+                    },
+                    Err(e) => {
+                        panic!("Failed to read input: {}", e);
+                    }
+                }
+            }
+            else {
+                panic!("Config file {} is invalid, and will not be regenerated.", FILE_NAME);
+            }
+        },
+        Err(e) => {
+            panic!("Failed to read input: {}", e);
+        }
+    }
 }
 
 fn write_to_config(contents: String) {
-    fs::write(FILE_NAME, contents).expect(&format!("Config file {} could not be created, or could not be written to.\nIf the program lacks sufficient permissions to create the file, it will likely be unable to write to it later.", FILE_NAME));
+    fs::write(FILE_NAME, contents).expect(&format!("Config file {} could not be created, or could not be written to.\nAre we missing permissions?.", FILE_NAME));
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Default, Clone)]
@@ -186,6 +268,7 @@ pub struct AppConfig {
     api_token: String,
     clone_repo: RepoInfo,
     into_repo: RepoInfo,
+    owned_url: String,
     date_from: NaiveDate,
     days_between: u32,
     time_offset: Option<NaiveTime>,
