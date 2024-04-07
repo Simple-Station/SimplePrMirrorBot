@@ -1,42 +1,50 @@
-use std::io::{stdout, Write};
 use std::path::Path;
 use std::fs;
 use std::thread::sleep;
 use std::time::Duration;
-use git2::{Error, Repository};
+use futures::executor::block_on;
+use git2::Repository;
+use git2::Error as GitError;
 use octocrab::{self, models::pulls::PullRequest, params, Octocrab};
 use serde_yaml::{self};
 use chrono::{DateTime, Days, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use clokwerk::Interval::{self};
 use clokwerk::{Job, Scheduler, TimeUnits};
+use tokio::time::timeout;
 
 mod git_utils;
+mod pr_template;
 
 #[allow(dead_code)]
 const COW: &str = "((...))\n( o o )\n \\   / \n  ^_^  ";
 
-const FILE_NAME: &str = "SimpleGitHubBot.yml";
+const FILE_NAME: &str = "pr_mirror_config.yml";
 
 // Debug vars
-const REGENERATE_CONFIG: bool = !true;
-const USE_TEMPLATE: bool = !false;
+/// Prevents any lasting net activity, such as pushing to branches, and opening PRs.
+/// Prints potential PRs to the console instead.
+pub const NO_NET_ACTIVITY: bool = !true;
+/// Only gathers and iterates over the first 100 PRs. Generally much faster.
+const FIRST_100_ONLY: bool = !true;
 
 // The template used to generate the YAML file when the application is first run.
 //-- Copy this line out of this file, Find and Replace (with RegEx) '\\n' with '\n' to break it up, then do the opposite to put it back together.
-const YAML_TEMPLATE: &str = "### NOTE THAT THIS FILE WILL BE ALTERED7\n\n### The bot uses this file to store per-run data, and regenerates it every run.\n\
+const YAML_TEMPLATE: &str = "### NOTE THAT THIS FILE WILL BE ALTERED\n\n### The bot uses this file to store per-run data, and regenerates it every run.\n\
                             ### The information you enter will be used and remembered, but do not rely on it being static.\n\n\
                             ## Your GitHub API token\napi_token: token-here\n\
                             ## The repo we'll be cloning PRs from\nclone_repo:\n  ## The owner or org of the repository\n  owner: space-wizards\n  ## The name of the repository\n  name: space-station-14\n  ## The branch to check for PRs on\n  branch: master\n\
                             ## The repo we'll be making our PR to\ninto_repo:\n  ## The owner or org of the repository to clone PRs into\n  owner: Simple-Station\n  ## The name of the repository to clone PRs into\n  name: Parkstation\n  ## The branch to clone PRs into\n  branch: master\n\
-                            ## The date to start checking for PRs from\n## Note that if this is too low, you'll get *every PR ever made*. This will be a lot of PRs. Format is YYYY-MM-DD\ndate_from: 2024-01-01\n\
-                            ## The number of days between checks for new PRs\n## '7' would run once a week\n## A value of '0' will run once before exiting\ndays_betwen: 7";
+                            ## The date to start checking for PRs from\n## Note that if this is too low, you'll get *every PR ever made*. This will be a lot of PRs. Format is YYYY-MM-DD\ndate_from: 2006-06-17\n\
+                            ## The number of days between checks for new PRs\n## '7' would run once a week\n## A value of '0' will run once before exiting\ndays_between: 7\n\
+                            ## A list of users to ignore PRs from\nignored_users: [ 'github-actions[bot]' ]";
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let config = generate_config();
 
     if config.days_between == 0 {
         println!("'days_between' is set to 0, running once then exiting.");
-        mirror_prs(generate_config()); //? Completely circumvents the scheduling and file writing all together.
+        mirror_prs(generate_config()).await; //? Completely circumvents the scheduling and file writing all together.
         return;
     }
 
@@ -49,12 +57,14 @@ fn main() {
         let until_first_run_int = until_first_run.days();
 
         println!("First run will be at {}, in {} days.", first_run.naive_local(), until_first_run);
+        println!("This program will now loop indefinitely. It should obviously be run in the background.");
 
         let mut prime_scheduler = Scheduler::with_tz(Utc);
         prime_scheduler.every(until_first_run_int).once().run(move || loop_schedules(setup_tasks(config.clone())));
     }
     else {
         println!("Running mirror now and setting up repeating task to run every {} days.", config.days_between);
+        println!("This program will now loop indefinitely. It should obviously be run in the background.");
 
         run_tasks();
         loop_schedules(setup_tasks(config));
@@ -64,8 +74,8 @@ fn main() {
 fn loop_schedules(mut scheduler: Scheduler::<Utc>) {
     loop {
         scheduler.run_pending();
-        print!("Chked!");
-        let _ = stdout().flush();
+        // print!(".");
+        // let _ = stdout().flush();
         sleep(Duration::from_millis(500));
     }
 }
@@ -82,23 +92,21 @@ fn run_tasks() {
     let config = generate_config();
     println!("Running scheduled tasks at {}.", Local::now().to_rfc2822());
     
-    mirror_prs(config.clone());
+    block_on(mirror_prs(config.clone()));
 
     finalize(config);
 }
 
-#[tokio::main]
 async fn mirror_prs(config: AppConfig) {
-    println!("Mirroing all merged PRs since {} from {}/{}/{} to {}/{}/{}.",
+    println!("Mirroring all merged PRs since {} from {}/{}/{} to {}/{}/{}.",
         config.date_from_with_time(),
         config.clone_repo.owner, config.clone_repo.name, config.clone_repo.branch,
         config.into_repo.owner, config.into_repo.name, config.into_repo.branch);
 
-    let mut octocrab = octocrab::OctocrabBuilder::new();
-    octocrab = octocrab.user_access_token(config.api_token.clone());
-    let octocrab = octocrab.build();
-    eprintln!("\nDid build\n");
-    let octocrab = octocrab.expect("Octocrab failed to build");
+    let octocrab = octocrab::OctocrabBuilder::new()
+        .user_access_token(config.api_token.clone())
+        .build()
+        .expect("Octocrab failed to build");
 
     let mut all_prs = get_all_prs(&octocrab, &config).await;
 
@@ -113,8 +121,15 @@ async fn mirror_prs(config: AppConfig) {
 
     let debug = config.debug.unwrap_or(false);
 
-    all_prs.retain(|pr| pr.merged_at.is_some());
-    all_prs.retain(|pr| { if debug { dbg!(pr.number); dbg!(pr.merged_at.unwrap()); dbg!(date_time_cutoff); } pr.merged_at.unwrap() >= date_time_cutoff });
+    // I know the following lines are gross.
+    // Debug info :)
+    if debug { println!("\nChecking for unmerged PRs."); }
+    all_prs.retain(|pr| { if debug && !pr.merged_at.is_some() { print!("Ignoring unmerged PR #{}, ", pr.number); } return pr.merged_at.is_some(); });
+    if debug { println!("\n\nChecking for cutoff date {}", date_time_cutoff); }
+    all_prs.retain(|pr| { if debug && pr.merged_at.unwrap() < date_time_cutoff { print!("Ignoring PR #{} merged before cutoff at {}, ", pr.number, pr.merged_at.unwrap()) } return pr.merged_at.unwrap() >= date_time_cutoff; });
+    if debug { println!("\n\nChecking for ignored users: {:?}", config.ignored_users); }
+    all_prs.retain(|pr| pr.user.to_owned().is_some_and(|user| { if config.ignored_users.contains(&user.login) { if debug { print!("Ignoring PR #{} made by ignored user {}, ", pr.number, &user.login) } return false } return true })); // This will also ignore any prs that don't have users I guess??
+    if debug { println!("\n\n"); }
     all_prs.sort_unstable_by_key(|pr| pr.merged_at);
 
     if all_prs.is_empty() {
@@ -124,7 +139,13 @@ async fn mirror_prs(config: AppConfig) {
 
     println!("Filtered down to {} PRs starting at {} and ending at {}.", all_prs.len(), all_prs.first().unwrap().number, all_prs.last().unwrap().number);
 
-    let repo = git_utils::ensure_repo(&config).expect("Unable to get or create local repo!");
+    let repo = match git_utils::ensure_repo(&config) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to get or create local repository: {}", e);
+            return;
+        }
+    };
 
     for merged_pr in all_prs.iter() {
         println!("Cherry-picking and pushing PR #{}.", merged_pr.number);
@@ -133,58 +154,131 @@ async fn mirror_prs(config: AppConfig) {
                 println!("Cherry-picked and pushed PR #{}.", merged_pr.number);
             },
             Err(e) => {
-                eprintln!("Failed to cherry-pick and push PR #{}: {}", merged_pr.number, e);
+                eprintln!("Failed to cherry-pick and push PR #{} {}: {}", merged_pr.number, merged_pr.title.clone().unwrap_or_default(), e);
             }
         }
-        git_utils::reset_repo(&repo, &config).expect("Failed to reset repository.");
-    }
+        
+        if git_utils::reset_repo(&repo, &config).is_err() {
+            eprintln!("Failed to reset repository after cherry-picking PR #{}.", merged_pr.number);
+            return;
+        }
 
-    // let mut text = String::new();
-    // for pr in all_prs.iter() {
-    //     text += "--------------------------------------\n";
-    //     text += &format!("Merged pr #{}: {:?}\n", pr.number, pr.title.clone().unwrap());
-    //     text += &format!("Merged at: {} by a {:?}\n", pr.merged_at.unwrap(), pr.author_association.clone().unwrap());
-    //     text += &format!("Adds {:#?} lines and removes {:#?} lines\n", pr.additions, pr.deletions);
-    //     text += &format!("It had {:#?} comments, {:#?} commits and {:#?} changed files\n", pr.comments, pr.commits, pr.changed_files);
-    //     text += &format!("It was opened at {:#?}\n", pr.created_at.unwrap());
-    // }
-    // println!("{}", text);
+        println!(""); // New line to seperate them.
+    }
 }
 
-fn cherry_pick_and_push_pr(repo: &Repository, merged_pr: PullRequest, config: &AppConfig) -> Result<(), Error> {
-    let sha = merged_pr.merge_commit_sha.expect("No merge commit sha found.");
-    let ri = &config.into_repo;
-    let rc = &config.clone_repo;
-    let branch_name = format!("{}-{}-{}-{}-into-{}-{}-{}", rc.owner, rc.name, rc.branch, merged_pr.number, ri.owner, ri.name, ri.branch);
+fn cherry_pick_and_push_pr(repo: &Repository, merged_pr: PullRequest, config: &AppConfig) -> Result<(), GitError> {
+    let sha = match merged_pr.merge_commit_sha.to_owned() {
+        Some(s) => s,
+        None => {
+            eprintln!("PR #{} has no merge commit SHA.", merged_pr.number);
+            return Err(GitError::from_str("No merge commit SHA."));
+        }
+    };
+    
+    let branch_name = format!("{}_{}_{}_{}",
+        &config.clone_repo.owner,
+        &config.clone_repo.name,
+        merged_pr.number,
+        Utc::now().date_naive()
+    );
 
     println!("Creating branch {}.", branch_name);
     git_utils::create_branch(&repo, &branch_name)?;
-    println!("Cherry-picking commit {}.", sha);
+
+    println!("Cherry-picking commit {}.", &sha);
     git_utils::cherry_pick_commit(&repo, &config, &sha)?;
-    println!("Pushing to remote {}-{}.", config.owned_url, branch_name);
+
+    println!("Pushing to remote branch {}.", branch_name);
     git_utils::push_to_remote(&repo, &config)?;
+
+    println!("Making pull request for {}.", branch_name);
+    block_on(make_pull_request(&config, merged_pr, Some(sha), &branch_name));
 
     return Ok(());
 }
 
+async fn make_pull_request(config: &AppConfig, pr: PullRequest, merge_sha: Option<String>, branch: &str) {
+    let octocrab = octocrab::OctocrabBuilder::new()
+        .user_access_token(config.api_token.clone())
+        .build().expect("make_pull_request: Failed to build Octocrab");
+
+    let merge_commit = match merge_sha {
+        Some(s) => {
+            let commit = octocrab.commits(&config.clone_repo.owner, &config.clone_repo.name)
+                .get(&s)
+                .await;
+
+            match commit {
+                Ok(c) => Some(c),
+                Err(_) => None,
+            }
+        }
+        None => None,
+    };
+
+    let title = pr.title.clone().unwrap_or_default();
+    let head = format!("{}:{}", "SimpleStation14", branch);
+    let base = config.into_repo.branch.clone();
+
+    if !NO_NET_ACTIVITY{
+        let pr_attempt = octocrab.pulls(&config.into_repo.owner, &config.into_repo.name) //TODO: Not hardcode this username. Should be able to get it from the API.
+            .create(&title, &head, &base)
+            .body(pr_template::PrTemplate::new(&pr, merge_commit).to_markdown())
+            // .draft(true)
+            .send()
+            .await;
+    
+        if pr_attempt.is_err() {
+            let error_message = match pr_attempt.err() {
+                Some(e) => e.to_string(),
+                None => "Unknown error.".to_string(),
+            };
+            
+            eprintln!("Failed to create pull request for {}: {}", pr.number, error_message);
+            eprintln!("This is probably a permissions issue.");
+        }
+    }
+    else {
+        println!("{}", pr_template::PrTemplate::new(&pr, merge_commit).to_markdown());
+    }
+}
+
 async fn get_all_prs(octocrab: &Octocrab, config: &AppConfig) -> Vec<PullRequest> {
     // Returns the first page of all prs.
-    let mut page = octocrab.pulls(&config.clone_repo.owner, &config.clone_repo.name).list()
+    let mut page = match octocrab.pulls(&config.clone_repo.owner, &config.clone_repo.name).list()
         .base(&config.clone_repo.branch)
         .state(params::State::Closed)
         .per_page(100)
-        .send().await.expect("Failed to find repository PRs.");
+        .send().await {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("Failed to get first page of PRs for {}/{}: {}",
+                    config.clone_repo.owner,
+                    config.clone_repo.name,
+                    err
+                );
+                return Vec::new();
+            }
+        };
 
     // Start our collection.
     let mut all_prs = page.take_items();
 
-    // As long as we're not in debug mode, get all pages.
-    // This takes a very long time, so we skip it for testing.
-    if !config.debug.unwrap_or(false) {
-        let msg = &"Failed to get all pages- are you being rate limited?";
-        let all_pages = octocrab.all_pages(page).await.expect(msg);
-        all_prs.extend(all_pages.iter().cloned());
+    // Getting all PRs takes a very long time, so we check if we should skip it.
+    if FIRST_100_ONLY {
+        println!("Retrieving only the first 100 PRs.");
+        return all_prs;
     }
+
+    println!("Attempting to gather all PR data- this may take a while...");
+    all_prs.extend(match octocrab.all_pages(page).await {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("Failed to get all pages- are you being rate limited?: {}", err);
+            return all_prs;
+        }
+    });
 
     return all_prs;
 }
@@ -204,14 +298,9 @@ fn finalize(mut config: AppConfig) {
 
 fn generate_config() -> AppConfig {
     // Create the file if it doesn't exist.
-    if !Path::new(FILE_NAME).exists() || REGENERATE_CONFIG {
-        println!("{}", format!("Config file {} does not exist, attempting to create it at {}.", FILE_NAME, std::env::current_dir().unwrap().to_str().unwrap()));
-        if USE_TEMPLATE {
-            write_to_config(YAML_TEMPLATE.to_string());
-        }
-        else {
-            write_to_config(serde_yaml::to_string(&AppConfig::default()).unwrap());
-        }
+    if !Path::new(FILE_NAME).exists() {
+        println!("Config file does not exist, attempting to create it at {}/{}.", std::env::current_dir().expect("Couldn't find current dir! Are we lacking permissions?").to_str().unwrap_or_default(), FILE_NAME);
+        write_to_config(YAML_TEMPLATE.to_string());
         panic!("Config file {} created. Please fill in the necessary information and run the program again.", FILE_NAME);
     }
 
@@ -220,27 +309,39 @@ fn generate_config() -> AppConfig {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to parse config file: {}", e);
-            request_regenerate_config();
+
+            //-- This timesout in case we're running in a non-interactive environment.
+            //--  (timesout in 120 seconds)
+            // This just straight up doesn't work right now, but it doesn't break anything so I left it in.
+            if block_on(timeout(Duration::from_secs(120), request_regenerate_config())).is_err() {
+                println!("Timed out waiting for user input.");
+            }
+                
             panic!();
         }
     };
 }
 
-fn request_regenerate_config() {
-    println!("Config file {} is invalid, would you like to regenerate it? (THIS WILL DELETE THE CURRENT FILE) (y/n)", FILE_NAME);
+// fn get_bot_name() -> String { //TODO: Get the bot's info (email, etc.).
+//     // Api request to get the bot's name from the owned repo.
+//     let octocrab = octocrab::Octocrab::builder()
+// }
+
+async fn request_regenerate_config() {
+    println!("Config file {} is invalid, would you like to regenerate it? (THIS WILL DELETE THE CURRENT FILE) (y/N)", FILE_NAME);
     let mut input = String::new();
     match std::io::stdin().read_line(&mut input) {
         Ok(_) => {
             if input.trim().to_lowercase() == "y" {
                 input = String::new();
-                println!("Would you like to regenerate the file using a hardcoded template (with documentation) (y), or a default src-exact template (n)?");
+                println!("Would you like to regenerate the file using a hardcoded template (with documentation) (1), or a default src-exact template (2)?");
                 match std::io::stdin().read_line(&mut input) {
                     Ok(_) => {
-                        if input.trim().to_lowercase() == "y" {
-                            write_to_config(YAML_TEMPLATE.to_string());
+                        if input.trim().to_lowercase() == "2" {
+                            write_to_config(serde_yaml::to_string(&AppConfig::default()).unwrap());
                         }
                         else {
-                            write_to_config(serde_yaml::to_string(&AppConfig::default()).unwrap());
+                            write_to_config(YAML_TEMPLATE.to_string());
                         }
                         panic!("Config file {} has been regenerated. Please fill in the necessary information and run the program again.", FILE_NAME);
                     },
@@ -263,14 +364,15 @@ fn write_to_config(contents: String) {
     fs::write(FILE_NAME, contents).expect(&format!("Config file {} could not be created, or could not be written to.\nAre we missing permissions?.", FILE_NAME));
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, Default, Clone)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct AppConfig {
     api_token: String,
     clone_repo: RepoInfo,
     into_repo: RepoInfo,
-    owned_url: String,
+    // owned_url: String,
     date_from: NaiveDate,
     days_between: u32,
+    ignored_users: Vec<String>,
     time_offset: Option<NaiveTime>,
     #[serde(skip_serializing_if = "Option::is_none")]
     debug: Option<bool>,
@@ -295,5 +397,38 @@ impl AppConfig {
     fn days_between_days(&self) -> Days {
         return Days::new(self.days_between as u64);
     }
+
+    fn get_repo_path(&self) -> String {
+        let path = format!("{}_{}_into_{}_{}",
+            self.clone_repo.owner,
+            self.clone_repo.name,
+            self.into_repo.owner,
+            self.into_repo.name
+        );
+    
+        return path;
+    }
 }
 
+impl Default for AppConfig {
+    fn default() -> Self {
+        return AppConfig {
+            api_token: String::default(),
+            clone_repo: RepoInfo {
+                owner: "space-wizards".to_string(),
+                name: "space-station-14".to_string(),
+                branch: "master".to_string(),
+            },
+            into_repo: RepoInfo {
+                owner: "Simple-Station".to_string(),
+                name: "Parkstation".to_string(),
+                branch: "master".to_string(),
+            },
+            date_from: NaiveDate::from_ymd_opt(2006, 6, 17).unwrap(),
+            days_between: 7,
+            ignored_users: Vec::new(),
+            time_offset: None,
+            debug: None,
+        };
+    }
+}

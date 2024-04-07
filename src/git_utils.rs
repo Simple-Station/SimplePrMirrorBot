@@ -1,39 +1,60 @@
 use std::{cell::RefCell, io::{self, stdout, Write}, path::{Path, PathBuf}};
-// use git2::{self, build::{CheckoutBuilder, RepoBuilder}, Error, FetchOptions, FileFavor, Progress, RemoteCallbacks, Repository, Signature, Time};
+use chrono::Local;
 use git2::{self, Progress, *, build::*}; // Progress needs to be explicitly imported here since it conflicts with one in 'build::'
+use octocrab::OctocrabBuilder;
+use tokio::task::block_in_place;
 use crate::AppConfig;
 
-const INTO_REMOTE_NAME: &str = "origin";
-const CLONE_REMOTE_NAME: &str = "cloned";
-const PUSH_REMOTE_NAME: &str = "owned";
+const PR_REMOTE_NAME: &str = "upstream";
+const COPY_REMOTE_NAME: &str = "cloned";
+const PUSH_REMOTE_NAME: &str = "origin";
+
+const BOT_USERNAME: &str = "PrMirrorBot";
+const BOT_EMAIL: &str = "ss14parkstation@simplestation.org";
 
 /// Pushes the current branch to the owned remote with the same branch name.
 pub fn push_to_remote(repo: &Repository, config: &AppConfig) -> Result<(), Error> {
+    if crate::NO_NET_ACTIVITY {
+        return Ok(());
+    }
+
     let mut remote = repo.find_remote(PUSH_REMOTE_NAME)?;
-
-    println!("Pushing to {} from {}", PUSH_REMOTE_NAME, format!("refs/heads/{}", repo.head()?.shorthand().unwrap()));
-
-    let mut remote_callbacks = RemoteCallbacks::new();
-    remote_callbacks.credentials(|_, _, _| {
-        println!("Attempting to authenticate");
-        return git2::Cred::userpass_plaintext("PrMirrorBut", &config.api_token);
-    });
-
-    remote_callbacks.push_transfer_progress(|arg1, arg2, arg3| {
-        print!("Pushing: {}/{}: {}\r", arg1, arg2, arg3);
-        std::io::stdout().flush().unwrap();
-    });
-
-    let mut push_options = git2::PushOptions::new();
-    push_options.remote_callbacks(remote_callbacks);
     
-    // let branch_name = repo.
+    {
+        let mut stdout = stdout().lock();
 
-    remote.push(&[&format!("refs/heads/{}", repo.head()?.shorthand().unwrap())], Some(&mut push_options)).expect("Grb");
+        let mut remote_callbacks = RemoteCallbacks::new();
+        remote_callbacks.credentials(|_, _, _| {
+            println!("Attempting to authenticate");
+            return git2::Cred::userpass_plaintext(&BOT_USERNAME, &config.api_token);
+        });
+        
+        remote_callbacks.push_update_reference(|_, opt| {
+            if opt.is_some() {
+                return Err(Error::new(ErrorCode::Ambiguous, ErrorClass::Callback, format!("Failed to push! {:?}", opt)));
+            }
+            return Ok(());
+        });
+        
+        remote_callbacks.push_transfer_progress(|arg1, arg2, arg3| {
+            print!("Pushing: {}/{}: {}\r", arg1, arg2, arg3);
+            std::io::stdout().flush().unwrap();
+        });
+        
+        remote_callbacks.pack_progress(|arg1, arg2, arg3| {
+            _ = write!(stdout, "Packing-{:?}: {}/{}\r", arg1, arg2, arg3);
+            std::io::stdout().flush().unwrap();
+        });
 
-    println!("Push successful");
+        let mut push_options = git2::PushOptions::new();
+        push_options.remote_callbacks(remote_callbacks);
+    
+        remote.push(&[&format!("refs/heads/{}:refs/heads/{}", repo.head()?.shorthand().unwrap_or_default(), repo.head()?.shorthand().unwrap_or_default())], Some(&mut push_options))?;
+    }
 
-    Ok(())
+    println!("Pushing to {} from {}", PUSH_REMOTE_NAME, format!("refs/heads/{}", repo.head()?.shorthand().unwrap_or_default()));
+
+    return Ok(());
 }
 
 pub fn cherry_pick_commit(repo: &Repository, config: &AppConfig, sha: &str) -> Result<(), Error> {
@@ -56,7 +77,7 @@ pub fn cherry_pick_commit(repo: &Repository, config: &AppConfig, sha: &str) -> R
             // .depth(1)
             .remote_callbacks(fetch_callback);
 
-        let mut remote = repo.find_remote(&CLONE_REMOTE_NAME)?;
+        let mut remote = repo.find_remote(&COPY_REMOTE_NAME)?;
 
         remote.fetch(&[&config.clone_repo.branch], Some(&mut fetch_options), None)?;
     }
@@ -85,12 +106,16 @@ pub fn cherry_pick_commit(repo: &Repository, config: &AppConfig, sha: &str) -> R
     
     // Commit the changes.
     {
-        let signature = Signature::new("PrMirrorBot", "ss14parkstation@simplestation.org", &Time::new(0, 0))?;
+        let now = Local::now();
+        let commit_time = Time::new(now.timestamp(), now.offset().local_minus_utc() / 60);
+
+        let auth_sig = Signature::new(&commit.author().name().unwrap_or_default(), &commit.author().email().unwrap_or_default(), &commit.time()).unwrap();
+        let commit_sig = Signature::new(&BOT_USERNAME, &BOT_EMAIL, &commit_time).unwrap();
         let msg = format!("Cherry-picked commit {} from {}/{}/{}", sha, config.clone_repo.owner, config.clone_repo.name, config.clone_repo.branch);
         let commit = repo.head()?.peel_to_commit()?;
         let tree = repo.find_tree(repo.index()?.write_tree()?)?;
         
-        repo.commit(Some("HEAD"), &signature, &signature, &msg, &tree, &[&commit])?;
+        repo.commit(Some("HEAD"), &auth_sig, &commit_sig, &msg, &tree, &[&commit])?;
 
         repo.cleanup_state()?;
     }
@@ -118,9 +143,8 @@ pub fn create_branch(repo: &Repository, branch_name: &str) -> Result<(), Error> 
 
 /// Returns an up-to-date repo on the required branch.
 pub fn ensure_repo(config: &AppConfig) -> Result<Repository, Error> {
-    let path = get_repo_path(config);
-    let upstream_repo_info = &config.into_repo;
-    println!("Repo path: {}", path);
+    let path = config.get_repo_path();
+    let into_repo_info = &config.into_repo;
 
     let repo = match Repository::open(&path) {
         Ok(repo) => {
@@ -128,35 +152,60 @@ pub fn ensure_repo(config: &AppConfig) -> Result<Repository, Error> {
             repo
         },
         Err(_) => {
-            println!("Failed to open existing repo, setting up new one");
-            return setup_new_repo(&config, &path);
+            println!("Failed to open existing repo at {}, attempting to create a new one", path);
+            return block_in_place(|| setup_new_repo(&config, &path));
         }
     };
     
+    println!("Accessed repo at {}", path);
+
     let state = RefCell::new(State::default());
 
     {
-        repo.set_head(&format!("refs/heads/{}", upstream_repo_info.branch))?;
+        repo.set_head(&format!("refs/heads/{}", into_repo_info.branch))?;
 
-        // Handles the progress of the fetch.
-        let mut fetch_callback = RemoteCallbacks::new();
-        fetch_callback.transfer_progress(|stats| {
-            let mut state = state.borrow_mut();
-            state.progress = Some(stats.to_owned());
-            print(&mut *state);
-            let _ = stdout().flush();
-            return true;
-        });
-        
-        // Options relating to the fetch.
-        let mut fetch_options = FetchOptions::new();
-        fetch_options.update_fetchhead(true)
-            // .depth(1)
-            .remote_callbacks(fetch_callback);
-
+        // Fetches the latest changes from the upstream repo and pushes them to the owned fork.
         {
-            let mut remote = repo.find_remote(&INTO_REMOTE_NAME)?;
-            remote.fetch(&[&upstream_repo_info.branch], Some(&mut fetch_options), None)?;
+            // Handles the progress of the fetch.
+            let mut callback = RemoteCallbacks::new();
+            callback.transfer_progress(|stats| {
+                let mut state = state.borrow_mut();
+                state.progress = Some(stats.to_owned());
+                print(&mut *state);
+                let _ = stdout().flush();
+                return true;
+            });
+            callback.credentials(|_, _, _| {
+                println!("Attempting to authenticate");
+                return git2::Cred::userpass_plaintext(&BOT_USERNAME, &config.api_token);
+            });
+            // Options relating to the fetch.
+            let mut fetch_options = FetchOptions::new();
+            fetch_options.update_fetchhead(true)
+                // .depth(1)
+                .remote_callbacks(callback);
+
+            let mut fork_remote = repo.find_remote(&PR_REMOTE_NAME)?;
+            fork_remote.fetch(&[&into_repo_info.branch], Some(&mut fetch_options), None)?;
+
+            // let mut callback = RemoteCallbacks::new(); //TODO: This shouldn't be commented out.
+            // callback.transfer_progress(|stats| {
+            //     let mut state = state.borrow_mut();
+            //     state.progress = Some(stats.to_owned());
+            //     print(&mut *state);
+            //     let _ = stdout().flush();
+            //     return true;
+            // });
+            // callback.credentials(|_, _, _| {
+            //     println!("Attempting to authenticate");
+            //     return git2::Cred::userpass_plaintext(&BOT_USERNAME, &config.api_token);
+            // });
+            // // Options relating to the push.
+            // let mut push_options = PushOptions::new();
+            // push_options.remote_callbacks(callback);
+
+            // let mut push_remote = repo.find_remote(&PUSH_REMOTE_NAME)?;
+            // push_remote.push(&[&into_repo_info.branch], Some(&mut push_options))?;
         }
 
         let fetch_head = repo.find_reference("FETCH_HEAD")?;
@@ -171,7 +220,7 @@ pub fn ensure_repo(config: &AppConfig) -> Result<Repository, Error> {
             return Ok(repo);
         }
 
-        let mut local_branch = repo.find_reference(&format!("refs/heads/{}", upstream_repo_info.branch))?;
+        let mut local_branch = repo.find_reference(&format!("refs/heads/{}", into_repo_info.branch))?;
 
         local_branch.set_target(remote_commit_ref.id(), "")?;
 
@@ -198,14 +247,45 @@ pub fn ensure_repo(config: &AppConfig) -> Result<Repository, Error> {
 }
     
 /// Creates a new repo with all requirements set up.
-fn setup_new_repo(config: &AppConfig, path: &String) -> Result<Repository, Error> {
+#[tokio::main]
+async fn setup_new_repo(config: &AppConfig, path: &String) -> Result<Repository, Error> {
     let upstream_repo_info = &config.into_repo;
     let remote_url = url_from_name(&upstream_repo_info.owner, &upstream_repo_info.name);
     let clone_url = url_from_name(&config.clone_repo.owner, &config.clone_repo.name);
-    let owned_url = &config.owned_url;
+    // let owned_url = &config.owned_url;
     
-    println!("Remote URL: {}", remote_url);
-    
+    // Start by forking the upstream repo.
+    //? I don't love dragging all the Octocrab stuff into this as I wanted to keep it localised to main,
+    //? but this needs to happen upon the creation of a new repo, which main doesn't know anything about.
+    //? This is the cleanest solution for now.
+
+    // Lots of .expects below this point, but I doubt any of them will happen in a typical situation.
+
+    let octocrab = OctocrabBuilder::new()
+        .user_access_token(config.api_token.clone())
+        .build() // This doesn't throw a libgit2 error, so if it fails uhhhhh break and let the person know they already have a fork??
+        .expect("Was unable to prepare Octocrab, what did you do?? Is something wrong with your token?");
+
+    let fork = octocrab.repos(&config.into_repo.owner, &config.into_repo.name)
+        .create_fork()
+        .send()
+        .await
+        .expect("Was unable to make a fork of the repo! Are you sure the original Repo exists?");
+
+    let fork_url = match fork.clone_url {
+        Some(url) => url,
+        None => {
+            return Err(Error::new(ErrorCode::Ambiguous, ErrorClass::None, "Fork URL was not provided by GitHub"));
+        }
+    };
+
+    println!("Using fork at {}", fork_url.as_str());
+
+    //TODO: This doesn't seem to be needed.
+    // Wait a few seconds for the fork to be created.
+    // println!("Waiting to ensure fork to be created...");
+    // sleep(Duration::from_secs(6)).await;
+
     let state = RefCell::new(State {
         progress: None,
         total: 0,
@@ -243,18 +323,19 @@ fn setup_new_repo(config: &AppConfig, path: &String) -> Result<Repository, Error
         .update_fetchhead(true)
         .remote_callbacks(fetch_callback);
 
+    println!("Cloning repo locally");
     // Clones the repo.
     let repo = RepoBuilder::new()
-        .branch(&upstream_repo_info.branch)
+        // .branch(&upstream_repo_info.branch)
         .fetch_options(fetch_options)
         .with_checkout(checkout_builder)
-        .clone(&remote_url, Path::new(&path))?;
+        .clone(&fork_url.as_str(), Path::new(&path))?;
 
     // Adds the required remotes.
-    repo.remote(PUSH_REMOTE_NAME, &owned_url)?;
-    repo.remote(CLONE_REMOTE_NAME, &clone_url)?;
+    repo.remote(PR_REMOTE_NAME, &remote_url)?;
+    repo.remote(COPY_REMOTE_NAME, &clone_url)?;
 
-    println!("Cloned new repo");
+    println!("Forked and cloned new repo");
 
     return Ok(repo);
 }
@@ -275,30 +356,16 @@ pub fn reset_repo(repo: &Repository, config: &AppConfig) -> Result<(), Error> {
 
         let name = branch.name()?.unwrap().to_string();
 
-        match branch.delete() {
-            Ok(_) => println!("Cleaned up branch {}", name),
-            Err(_) => println!("Failed to delete branch {}", name),
+        if branch.delete().is_err() {
+            println!("Failed to delete branch {}", name);
         }
     }
 
     Ok(())
 }
 
-// fn get_checkout_options(state: &mut State) -> CheckoutBuilder<'static> {
-//     let mut checkout_builder = CheckoutBuilder::new();
-//     checkout_builder.force();
-//     checkout_builder.progress(|path, cur, total| {
-//         state.path = path.map(|p| p.to_path_buf());
-//         state.current = cur;
-//         state.total = total;
-//         print(state);
-//     });
-//     return checkout_builder;
-// }
-
-fn get_repo_path(config: &AppConfig) -> String {
-    let path = format!("{}_{}_cl_{}_{}", config.clone_repo.owner, config.clone_repo.name, config.into_repo.owner, config.into_repo.name);
-    return path;
+fn url_from_name(owner: &str, name: &str) -> String {
+    return format!("https://github.com/{}/{}", owner, name);
 }
 
 // Copied from the example docs, just prints a Git-style progress bar when cloning or fetching.
@@ -357,10 +424,6 @@ fn print(state: &mut State) {
         )
     }
     io::stdout().flush().unwrap();
-}
-
-fn url_from_name(owner: &str, name: &str) -> String {
-    return format!("https://github.com/{}/{}", owner, name);
 }
 
 #[derive(Default)]
