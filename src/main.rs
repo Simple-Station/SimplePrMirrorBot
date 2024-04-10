@@ -5,6 +5,7 @@ use std::time::Duration;
 use futures::executor::block_on;
 use git2::Repository;
 use git2::Error as GitError;
+use octocrab::models::Author;
 use octocrab::{self, models::pulls::PullRequest, params, Octocrab};
 use serde_yaml::{self};
 use chrono::{DateTime, Days, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -18,17 +19,18 @@ mod pr_template;
 #[allow(dead_code)]
 const COW: &str = "((...))\n( o o )\n \\   / \n  ^_^  ";
 
-const FILE_NAME: &str = "pr_mirror_config.yml";
+const FILE_NAME: &str = "simple_mirror_config.yml";
 
 // Debug vars
 /// Prevents any lasting net activity, such as pushing to branches, and opening PRs.
-/// Prints potential PRs to the console instead.
+/// Prints potential PRs and issues to the console instead.
 pub const NO_NET_ACTIVITY: bool = !true;
 /// Only gathers and iterates over the first 100 PRs. Generally much faster.
 const FIRST_100_ONLY: bool = !true;
+/// If this list is populated with pr numbers, the program will only cherry-pick and push those PRs instead of fetching any.
+const CHERRY_PICK_ONLY: [u64; 0] = [];
 
 // The template used to generate the YAML file when the application is first run.
-//-- Copy this line out of this file, Find and Replace (with RegEx) '\\n' with '\n' to break it up, then do the opposite to put it back together.
 const YAML_TEMPLATE: &str = "### NOTE THAT THIS FILE WILL BE ALTERED\n\n### The bot uses this file to store per-run data, and regenerates it every run.\n\
                             ### The information you enter will be used and remembered, but do not rely on it being static.\n\n\
                             ## Your GitHub API token\napi_token: token-here\n\
@@ -43,8 +45,17 @@ async fn main() {
     let config = generate_config();
 
     if config.days_between == 0 {
+        let config = generate_config();
+    
+        let octocrab = octocrab::OctocrabBuilder::new()
+            .user_access_token(config.api_token.clone())
+            .build()
+            .expect("Octocrab failed to build");
+    
+        let bot_info = block_on(get_bot_info(&octocrab));
+
         println!("'days_between' is set to 0, running once then exiting.");
-        mirror_prs(generate_config()).await; //? Completely circumvents the scheduling and file writing all together.
+        mirror_prs(&octocrab, &config, &bot_info).await; //? Completely circumvents the scheduling and file writing all together.
         return;
     }
 
@@ -90,23 +101,26 @@ fn setup_tasks(config: AppConfig) -> Scheduler::<Utc> {
 
 fn run_tasks() {
     let config = generate_config();
-    println!("Running scheduled tasks at {}.", Local::now().to_rfc2822());
-    
-    block_on(mirror_prs(config.clone()));
-
-    finalize(config);
-}
-
-async fn mirror_prs(config: AppConfig) {
-    println!("Mirroring all merged PRs since {} from {}/{}/{} to {}/{}/{}.",
-        config.date_from_with_time(),
-        config.clone_repo.owner, config.clone_repo.name, config.clone_repo.branch,
-        config.into_repo.owner, config.into_repo.name, config.into_repo.branch);
 
     let octocrab = octocrab::OctocrabBuilder::new()
         .user_access_token(config.api_token.clone())
         .build()
         .expect("Octocrab failed to build");
+
+    let bot_info = block_on(get_bot_info(&octocrab));
+    
+    println!("Running scheduled tasks at {}.", Local::now().to_rfc2822());
+    
+    block_on(mirror_prs(&octocrab, &config, &bot_info));
+
+    finalize(config);
+}
+
+async fn mirror_prs(octocrab: &Octocrab, config: &AppConfig, bot_info: &Author) {
+    println!("Mirroring all merged PRs since {} from {}/{}/{} to {}/{}/{}.",
+        config.date_from_with_time(),
+        config.clone_repo.owner, config.clone_repo.name, config.clone_repo.branch,
+        config.into_repo.owner, config.into_repo.name, config.into_repo.branch);
 
     let mut all_prs = get_all_prs(&octocrab, &config).await;
 
@@ -139,7 +153,7 @@ async fn mirror_prs(config: AppConfig) {
 
     println!("Filtered down to {} PRs starting at {} and ending at {}.", all_prs.len(), all_prs.first().unwrap().number, all_prs.last().unwrap().number);
 
-    let repo = match git_utils::ensure_repo(&config) {
+    let repo = match git_utils::ensure_repo(&config, &bot_info) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Failed to get or create local repository: {}", e);
@@ -149,12 +163,13 @@ async fn mirror_prs(config: AppConfig) {
 
     for merged_pr in all_prs.iter() {
         println!("Cherry-picking and pushing PR #{}.", merged_pr.number);
-        match cherry_pick_and_push_pr(&repo, merged_pr.clone(), &config) {
+        match cherry_pick_and_push_pr(&repo, merged_pr.clone(), &config, &bot_info) {
             Ok(_) => {
                 println!("Cherry-picked and pushed PR #{}.", merged_pr.number);
             },
             Err(e) => {
                 eprintln!("Failed to cherry-pick and push PR #{} {}: {}", merged_pr.number, merged_pr.title.clone().unwrap_or_default(), e);
+                make_issue(&config, &octocrab, merged_pr.clone(), e).await; // Report if something goes wrong.
             }
         }
         
@@ -167,7 +182,7 @@ async fn mirror_prs(config: AppConfig) {
     }
 }
 
-fn cherry_pick_and_push_pr(repo: &Repository, merged_pr: PullRequest, config: &AppConfig) -> Result<(), GitError> {
+fn cherry_pick_and_push_pr(repo: &Repository, merged_pr: PullRequest, config: &AppConfig, bot_info: &Author) -> Result<(), GitError> {
     let sha = match merged_pr.merge_commit_sha.to_owned() {
         Some(s) => s,
         None => {
@@ -187,10 +202,10 @@ fn cherry_pick_and_push_pr(repo: &Repository, merged_pr: PullRequest, config: &A
     git_utils::create_branch(&repo, &branch_name)?;
 
     println!("Cherry-picking commit {}.", &sha);
-    git_utils::cherry_pick_commit(&repo, &config, &sha)?;
+    git_utils::cherry_pick_commit(&repo, &config, &bot_info, &sha)?;
 
     println!("Pushing to remote branch {}.", branch_name);
-    git_utils::push_to_remote(&repo, &config)?;
+    git_utils::push_to_remote(&repo, &config, &bot_info)?;
 
     println!("Making pull request for {}.", branch_name);
     block_on(make_pull_request(&config, merged_pr, Some(sha), &branch_name));
@@ -203,10 +218,10 @@ async fn make_pull_request(config: &AppConfig, pr: PullRequest, merge_sha: Optio
         .user_access_token(config.api_token.clone())
         .build().expect("make_pull_request: Failed to build Octocrab");
 
-    let merge_commit = match merge_sha {
+    let merge_commit = match &merge_sha {
         Some(s) => {
             let commit = octocrab.commits(&config.clone_repo.owner, &config.clone_repo.name)
-                .get(&s)
+                .get(s)
                 .await;
 
             match commit {
@@ -235,7 +250,7 @@ async fn make_pull_request(config: &AppConfig, pr: PullRequest, merge_sha: Optio
                 None => "Unknown error.".to_string(),
             };
             
-            eprintln!("Failed to create pull request for {}: {}", pr.number, error_message);
+            eprintln!("Failed to create pull request for {}: {}\n{}", pr.number, error_message, merge_sha.unwrap_or_default());
             eprintln!("This is probably a permissions issue.");
         }
     }
@@ -244,9 +259,66 @@ async fn make_pull_request(config: &AppConfig, pr: PullRequest, merge_sha: Optio
     }
 }
 
+async fn make_issue(config: &AppConfig, octocrab: &Octocrab, pr: PullRequest, error: GitError) {
+    let merge_commit = match pr.merge_commit_sha {
+        Some(ref s) => {
+            let commit = octocrab.commits(&config.clone_repo.owner, &config.clone_repo.name)
+                .get(s)
+                .await;
+
+            match commit {
+                Ok(c) => Some(c),
+                Err(_) => None,
+            }
+        }
+        None => None,
+    };
+
+    let title = format!("Failed to cherry-pick PR #{}: {}", pr.number, pr.title.clone().unwrap_or_default());
+    let body = format!("## Failed to cherry-pick PR: {}\nPR body below\n\n{}", error, pr_template::PrTemplate::new(&pr, merge_commit).to_markdown());
+
+    if !NO_NET_ACTIVITY {
+        let issue_handler = octocrab.issues(&config.into_repo.owner, &config.into_repo.name)
+            .create(&title)
+            .body(&body)
+            // .assignees(assignees) //TODO: Automatic assignees and labels?
+            // .labels(labels)
+            .send()
+            .await;
+
+        if issue_handler.is_err() {        
+            eprintln!("Failed to create issue for missed PR #{}: {}", pr.number, issue_handler.err().unwrap());
+            eprintln!("This is probably a permissions issue.");
+        }
+    }
+    else {
+        println!("{}\n{}", title, body);
+    }
+}
+
 async fn get_all_prs(octocrab: &Octocrab, config: &AppConfig) -> Vec<PullRequest> {
+    if !CHERRY_PICK_ONLY.is_empty() {
+        let mut prs = Vec::new();
+        for num in CHERRY_PICK_ONLY.iter() {
+            let pr = match octocrab.pulls(&config.clone_repo.owner, &config.clone_repo.name)
+                .get(*num)
+                .await {
+                    Ok(p) => p,
+                    Err(err) => {
+                        eprintln!("Failed to get PR by number {}: {}", num, err);
+                        continue;
+                    }
+                };
+
+            prs.push(pr);
+        }
+
+        return prs;
+    }
+
     // Returns the first page of all prs.
-    let mut page = match octocrab.pulls(&config.clone_repo.owner, &config.clone_repo.name).list()
+    let mut page = match octocrab.pulls(&config.clone_repo.owner, &config.clone_repo.name)
+        .list()
         .base(&config.clone_repo.branch)
         .state(params::State::Closed)
         .per_page(100)
@@ -326,6 +398,17 @@ fn generate_config() -> AppConfig {
 //     // Api request to get the bot's name from the owned repo.
 //     let octocrab = octocrab::Octocrab::builder()
 // }
+
+async fn get_bot_info(octocrab: &Octocrab) -> Author {
+    let bot = octocrab.current().user().await;
+
+    if bot.is_err() {
+        eprintln!("Couldn't obtain bot info: {}", bot.err().unwrap());
+        panic!("Failed to get bot info.");
+    }
+
+    return bot.unwrap();
+}
 
 async fn request_regenerate_config() {
     println!("Config file {} is invalid, would you like to regenerate it? (THIS WILL DELETE THE CURRENT FILE) (y/N)", FILE_NAME);

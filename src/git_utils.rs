@@ -1,7 +1,7 @@
 use std::{cell::RefCell, io::{self, stdout, Write}, path::{Path, PathBuf}};
 use chrono::Local;
 use git2::{self, Progress, *, build::*}; // Progress needs to be explicitly imported here since it conflicts with one in 'build::'
-use octocrab::OctocrabBuilder;
+use octocrab::{models::Author, OctocrabBuilder};
 use tokio::task::block_in_place;
 use crate::AppConfig;
 
@@ -9,11 +9,8 @@ const PR_REMOTE_NAME: &str = "upstream";
 const COPY_REMOTE_NAME: &str = "cloned";
 const PUSH_REMOTE_NAME: &str = "origin";
 
-const BOT_USERNAME: &str = "PrMirrorBot";
-const BOT_EMAIL: &str = "ss14parkstation@simplestation.org";
-
 /// Pushes the current branch to the owned remote with the same branch name.
-pub fn push_to_remote(repo: &Repository, config: &AppConfig) -> Result<(), Error> {
+pub fn push_to_remote(repo: &Repository, config: &AppConfig, bot_info: &Author) -> Result<(), Error> {
     if crate::NO_NET_ACTIVITY {
         return Ok(());
     }
@@ -26,7 +23,7 @@ pub fn push_to_remote(repo: &Repository, config: &AppConfig) -> Result<(), Error
         let mut remote_callbacks = RemoteCallbacks::new();
         remote_callbacks.credentials(|_, _, _| {
             println!("Attempting to authenticate");
-            return git2::Cred::userpass_plaintext(&BOT_USERNAME, &config.api_token);
+            return git2::Cred::userpass_plaintext(&bot_info.login, &config.api_token);
         });
         
         remote_callbacks.push_update_reference(|_, opt| {
@@ -57,7 +54,7 @@ pub fn push_to_remote(repo: &Repository, config: &AppConfig) -> Result<(), Error
     return Ok(());
 }
 
-pub fn cherry_pick_commit(repo: &Repository, config: &AppConfig, sha: &str) -> Result<(), Error> {
+pub fn cherry_pick_commit(repo: &Repository, config: &AppConfig, bot_info: &Author, sha: &str) -> Result<(), Error> {
     {
         let state = RefCell::new(State::default());
 
@@ -109,8 +106,8 @@ pub fn cherry_pick_commit(repo: &Repository, config: &AppConfig, sha: &str) -> R
         let now = Local::now();
         let commit_time = Time::new(now.timestamp(), now.offset().local_minus_utc() / 60);
 
-        let auth_sig = Signature::new(&commit.author().name().unwrap_or_default(), &commit.author().email().unwrap_or_default(), &commit.time()).unwrap();
-        let commit_sig = Signature::new(&BOT_USERNAME, &BOT_EMAIL, &commit_time).unwrap();
+        let auth_sig = Signature::new(&commit.author().name().unwrap_or("Unkown"), &commit.author().email().unwrap_or("Unkown"), &commit.time()).unwrap();
+        let commit_sig = Signature::new(&bot_info.login, &bot_info.email.to_owned().unwrap_or("Unknown".to_string()), &commit_time).unwrap();
         let msg = format!("Cherry-picked commit {} from {}/{}/{}", sha, config.clone_repo.owner, config.clone_repo.name, config.clone_repo.branch);
         let commit = repo.head()?.peel_to_commit()?;
         let tree = repo.find_tree(repo.index()?.write_tree()?)?;
@@ -142,7 +139,7 @@ pub fn create_branch(repo: &Repository, branch_name: &str) -> Result<(), Error> 
 }
 
 /// Returns an up-to-date repo on the required branch.
-pub fn ensure_repo(config: &AppConfig) -> Result<Repository, Error> {
+pub fn ensure_repo(config: &AppConfig, botinfo: &Author) -> Result<Repository, Error> {
     let path = config.get_repo_path();
     let into_repo_info = &config.into_repo;
 
@@ -177,7 +174,7 @@ pub fn ensure_repo(config: &AppConfig) -> Result<Repository, Error> {
             });
             callback.credentials(|_, _, _| {
                 println!("Attempting to authenticate");
-                return git2::Cred::userpass_plaintext(&BOT_USERNAME, &config.api_token);
+                return git2::Cred::userpass_plaintext(&botinfo.login, &config.api_token);
             });
             // Options relating to the fetch.
             let mut fetch_options = FetchOptions::new();
