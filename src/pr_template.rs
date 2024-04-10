@@ -56,12 +56,6 @@ impl PrTemplate {
             template.merge_sha = pr.merge_commit_sha.unwrap();
         }
 
-        template.changed_files = pr.changed_files.unwrap_or_default().to_string();
-
-        template.additions = pr.additions.unwrap_or_default().to_string();
-
-        template.deletions = pr.deletions.unwrap_or_default().to_string();
-
         if pr.html_url.is_some() {
             template.url_pr = pr.html_url.unwrap().as_str().to_string();
         }
@@ -114,12 +108,23 @@ impl PrTemplate {
         }
 
         if merge_commit.is_some() {
-            let user = merge_commit.unwrap().author;
-            if user.is_some() {
-                let user = user.unwrap();
+            let commit = merge_commit.unwrap();
+
+            if let Some(user) = commit.committer { //TODO: Verify this is the correct person. Should be?
                 template.merge_user_name = user.login.clone();
                 template.merge_user_link = user.html_url.as_str().to_string();
                 template.merge_user_icon = user.avatar_url.as_str().to_string();
+            }
+            
+            if let Some(files) = commit.files {
+                template.changed_files = files.len().to_string();
+            }
+
+            if let Some(stats) = &commit.stats {
+                template.additions = stats.additions.unwrap_or_default().to_string();
+            }
+            if let Some(stats) = &commit.stats {
+                template.deletions = stats.deletions.unwrap_or_default().to_string();
             }
         }
 
@@ -130,13 +135,10 @@ impl PrTemplate {
         return format!(
             "## Mirror of  PR #{number}: [{title}]({url_pr}) from <img src=\"{owner_icon}\" alt=\"{owner_name}\" width=\"22\"/> [{owner_name}]({owner_link})/[{repo_name}]({repo_link})\n\
             \n\
-            <aside>PR opened by <img src=\"{open_user_icon}\" width=\"16\"/><a href=\"{open_user_link}\"> {open_user_name}</a> at {open_date}</aside>\n\
-            <aside>PR merged by <img src=\"{merge_user_icon}\" width=\"16\"/><a href=\"{merge_user_link}\"> {merge_user_name}</a> at {merge_date}</aside>\n\
-            <sup>\n\
+            ####### `{merge_sha}`\n\
             \n\
-            `{merge_sha}`\n\
-            \n\
-            </sup>\n\
+            PR opened by <img src=\"{open_user_icon}\" width=\"16\"/><a href=\"{open_user_link}\"> {open_user_name}</a> at {open_date}\n\
+            PR merged by <img src=\"{merge_user_icon}\" width=\"16\"/><a href=\"{merge_user_link}\"> {merge_user_name}</a> at {merge_date}\n\
             \n\
             ---\n\
             \n\
