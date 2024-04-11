@@ -135,7 +135,7 @@ impl PrTemplate {
         return format!(
             "## Mirror of  PR #{number}: [{title}]({url_pr}) from <img src=\"{owner_icon}\" alt=\"{owner_name}\" width=\"22\"/> [{owner_name}]({owner_link})/[{repo_name}]({repo_link})\n\
             \n\
-            ####### `{merge_sha}`\n\
+            ###### `{merge_sha}`\n\
             \n\
             PR opened by <img src=\"{open_user_icon}\" width=\"16\"/><a href=\"{open_user_link}\"> {open_user_name}</a> at {open_date}\n\
             PR merged by <img src=\"{merge_user_icon}\" width=\"16\"/><a href=\"{merge_user_link}\"> {merge_user_name}</a> at {merge_date}\n\

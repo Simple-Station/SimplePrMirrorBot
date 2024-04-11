@@ -25,20 +25,27 @@ const FILE_NAME: &str = "simple_mirror_config.yml";
 /// Prevents any lasting net activity, such as pushing to branches, and opening PRs.
 /// Prints potential PRs and issues to the console instead.
 pub const NO_NET_ACTIVITY: bool = !true;
+/// Prints finished PRs and issues to the console. Most useful when NO_NET_ACTIVITY is not false.
+const PRINT_PRS: bool = !true;
 /// Only gathers and iterates over the first 100 PRs. Generally much faster.
 const FIRST_100_ONLY: bool = !true;
 /// If this list is populated with pr numbers, the program will only cherry-pick and push those PRs instead of fetching any.
 const CHERRY_PICK_ONLY: [u64; 0] = [];
 
 // The template used to generate the YAML file when the application is first run.
-const YAML_TEMPLATE: &str = "### NOTE THAT THIS FILE WILL BE ALTERED\n\n### The bot uses this file to store per-run data, and regenerates it every run.\n\
-                            ### The information you enter will be used and remembered, but do not rely on it being static.\n\n\
-                            ## Your GitHub API token\napi_token: token-here\n\
-                            ## The repo we'll be cloning PRs from\nclone_repo:\n  ## The owner or org of the repository\n  owner: space-wizards\n  ## The name of the repository\n  name: space-station-14\n  ## The branch to check for PRs on\n  branch: master\n\
-                            ## The repo we'll be making our PR to\ninto_repo:\n  ## The owner or org of the repository to clone PRs into\n  owner: Simple-Station\n  ## The name of the repository to clone PRs into\n  name: Parkstation\n  ## The branch to clone PRs into\n  branch: master\n\
-                            ## The date to start checking for PRs from\n## Note that if this is too low, you'll get *every PR ever made*. This will be a lot of PRs. Format is YYYY-MM-DD\ndate_from: 2006-06-17\n\
-                            ## The number of days between checks for new PRs\n## '7' would run once a week\n## A value of '0' will run once before exiting\ndays_between: 7\n\
-                            ## A list of users to ignore PRs from\nignored_users: [ 'github-actions[bot]' ]";
+const YAML_TEMPLATE: &str = "
+                                ### NOTE THAT THIS FILE WILL BE ALTERED\n\n### The bot uses this file to store per-run data, and regenerates it every run.\n\
+                                ### The information you enter will be used and remembered, but do not rely on it being static.\n\n\
+                                ## Your GitHub API token\napi_token: token-here\n\
+                                ## The repo we'll be cloning PRs from\nclone_repo:\n  ## The owner or org of the repository\n  owner: space-wizards\n  ## The name of the repository\n  name: space-station-14\n  ## The branch to check for PRs on\n  branch: master\n\
+                                ## The repo we'll be making our PR to\ninto_repo:\n  ## The owner or org of the repository to clone PRs into\n  owner: Simple-Station\n  ## The name of the repository to clone PRs into\n  name: Parkstation\n  ## The branch to clone PRs into\n  branch: master\n\
+                                ## The date to start checking for PRs from\n## Note that if this is too low, you'll get *every PR ever made*. This will be a lot of PRs. Format is YYYY-MM-DD\ndate_from: 2006-06-17\n\
+                                ## The number of days between checks for new PRs\n## '7' would run once a week\n## A value of '0' will run once before exiting\ndays_between: 7\n\
+                                ## A list of labels to apply to PRs made by the bot\npr_labels: [ ]\n\
+                                ## A list of labels to apply to Issues made by the bot\nissue_labels: [ ]\n\
+                                ## A list of labels to ignore PRs with\n## If a PR has any of these labels, it won't be mirrored\nignored_labels: [ ]\n\
+                                ## A list of users to ignore PRs from\nignored_users: [ 'github-actions[bot]' ]
+                            ";
 
 #[tokio::main]
 async fn main() {
@@ -143,6 +150,8 @@ async fn mirror_prs(octocrab: &Octocrab, config: &AppConfig, bot_info: &Author) 
     all_prs.retain(|pr| { if debug && pr.merged_at.unwrap() < date_time_cutoff { print!("Ignoring PR #{} merged before cutoff at {}, ", pr.number, pr.merged_at.unwrap()) } return pr.merged_at.unwrap() >= date_time_cutoff; });
     if debug { println!("\n\nChecking for ignored users: {:?}", config.ignored_users); }
     all_prs.retain(|pr| pr.user.to_owned().is_some_and(|user| { if config.ignored_users.contains(&user.login) { if debug { print!("Ignoring PR #{} made by ignored user {}, ", pr.number, &user.login) } return false } return true })); // This will also ignore any prs that don't have users I guess??
+    if debug { println!("\n\nChecking for ignored labels: {:?}", config.ignored_labels); }
+    all_prs.retain(|pr| pr.labels.to_owned().is_some_and(|labels| { if labels.iter().any(|label| config.ignored_labels.contains(&label.name)) { if debug { print!("Ignoring PR #{} with ignored label, ", pr.number) } return false } return true }));
     if debug { println!("\n\n"); }
     all_prs.sort_unstable_by_key(|pr| pr.merged_at);
 
@@ -208,12 +217,12 @@ fn cherry_pick_and_push_pr(repo: &Repository, merged_pr: PullRequest, config: &A
     git_utils::push_to_remote(&repo, &config, &bot_info)?;
 
     println!("Making pull request for {}.", branch_name);
-    block_on(make_pull_request(&config, merged_pr, Some(sha), &branch_name));
+    block_on(make_pull_request(&config, &bot_info, merged_pr, Some(sha), &branch_name));
 
     return Ok(());
 }
 
-async fn make_pull_request(config: &AppConfig, pr: PullRequest, merge_sha: Option<String>, branch: &str) {
+async fn make_pull_request(config: &AppConfig, bot_info: &Author, original_pr: PullRequest, merge_sha: Option<String>, branch: &str) {
     let octocrab = octocrab::OctocrabBuilder::new()
         .user_access_token(config.api_token.clone())
         .build().expect("make_pull_request: Failed to build Octocrab");
@@ -232,30 +241,35 @@ async fn make_pull_request(config: &AppConfig, pr: PullRequest, merge_sha: Optio
         None => None,
     };
 
-    let title = pr.title.clone().unwrap_or_default();
-    let head = format!("{}:{}", "SimpleStation14", branch);
+    let title = format!("Mirror: {}", original_pr.title.clone().unwrap_or_default());
+    let head = format!("{}:{}", &bot_info.login, branch);
+    let body = pr_template::PrTemplate::new(&original_pr, merge_commit).to_markdown();
     let base = config.into_repo.branch.clone();
 
     if !NO_NET_ACTIVITY{
-        let pr_attempt = octocrab.pulls(&config.into_repo.owner, &config.into_repo.name) //TODO: Not hardcode this username. Should be able to get it from the API.
+        let pr_attempt = octocrab.pulls(&config.into_repo.owner, &config.into_repo.name)
             .create(&title, &head, &base)
-            .body(pr_template::PrTemplate::new(&pr, merge_commit).to_markdown())
+            .body(&body)
             // .draft(true)
             .send()
-            .await;
-    
-        if pr_attempt.is_err() {
-            let error_message = match pr_attempt.err() {
-                Some(e) => e.to_string(),
-                None => "Unknown error.".to_string(),
-            };
+            .await
+            .inspect_err(|e| {
+                eprintln!("Failed to create pull request for {}: {}\nSha: {}", original_pr.number, e, merge_sha.unwrap_or_default());
+                eprintln!("This is probably a permissions issue.");
+            });
+        
+        if pr_attempt.is_ok() {
+            let pr = pr_attempt.unwrap();
             
-            eprintln!("Failed to create pull request for {}: {}\n{}", pr.number, error_message, merge_sha.unwrap_or_default());
-            eprintln!("This is probably a permissions issue.");
+            let _ = octocrab.issues(&config.into_repo.owner, &config.into_repo.name)
+            .add_labels(pr.number, &config.pr_labels)
+            .await
+            .inspect_err(|e| eprintln!("Failed to add labels to PR #{}: {}", pr.number, e));
         }
     }
-    else {
-        println!("{}", pr_template::PrTemplate::new(&pr, merge_commit).to_markdown());
+
+    if PRINT_PRS {
+        println!("-------------\n{}\n{}\n-------------", title, &body);
     }
 }
 
@@ -281,8 +295,8 @@ async fn make_issue(config: &AppConfig, octocrab: &Octocrab, pr: PullRequest, er
         let issue_handler = octocrab.issues(&config.into_repo.owner, &config.into_repo.name)
             .create(&title)
             .body(&body)
-            // .assignees(assignees) //TODO: Automatic assignees and labels?
-            // .labels(labels)
+            // .assignees(assignees) //TODO: Automatic assignees?
+            .labels(Some(config.issue_labels.to_owned()))
             .send()
             .await;
 
@@ -291,13 +305,22 @@ async fn make_issue(config: &AppConfig, octocrab: &Octocrab, pr: PullRequest, er
             eprintln!("This is probably a permissions issue.");
         }
     }
-    else {
-        println!("{}\n{}", title, body);
+    
+    if PRINT_PRS {
+        println!("-------------\n{}\n{}\n-------------", title, &body);
     }
 }
 
 async fn get_all_prs(octocrab: &Octocrab, config: &AppConfig) -> Vec<PullRequest> {
-    if !CHERRY_PICK_ONLY.is_empty() {
+    let forced_prs: Option<Vec<u64>> = match !CHERRY_PICK_ONLY.is_empty() {
+        true => Some(CHERRY_PICK_ONLY.into()),
+        false => match !config.prs_to_pull.is_empty() {
+            true => Some(config.prs_to_pull.clone()),
+            false => None,
+        }
+    };
+
+    if forced_prs.is_some() {
         let mut prs = Vec::new();
         for num in CHERRY_PICK_ONLY.iter() {
             let pr = match octocrab.pulls(&config.clone_repo.owner, &config.clone_repo.name)
@@ -455,7 +478,16 @@ pub struct AppConfig {
     // owned_url: String,
     date_from: NaiveDate,
     days_between: u32,
+    #[serde(default)]
+    pr_labels: Vec<String>,
+    #[serde(default)]
+    issue_labels: Vec<String>,
+    #[serde(default)]
+    ignored_labels: Vec<String>,
+    #[serde(default)]
     ignored_users: Vec<String>,
+    #[serde(default)]
+    prs_to_pull: Vec<u64>,
     time_offset: Option<NaiveTime>,
     #[serde(skip_serializing_if = "Option::is_none")]
     debug: Option<bool>,
@@ -509,7 +541,11 @@ impl Default for AppConfig {
             },
             date_from: NaiveDate::from_ymd_opt(2006, 6, 17).unwrap(),
             days_between: 7,
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+            ignored_labels: Vec::new(),
             ignored_users: Vec::new(),
+            prs_to_pull: Vec::new(),
             time_offset: None,
             debug: None,
         };
