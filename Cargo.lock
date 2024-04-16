@@ -329,6 +329,7 @@ dependencies = [
  "clokwerk",
  "futures",
  "git2",
+ "http",
  "octocrab",
  "serde",
  "serde_yaml",

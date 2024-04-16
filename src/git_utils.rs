@@ -23,7 +23,7 @@ pub fn push_to_remote(repo: &Repository, config: &AppConfig, bot_info: &Author) 
         let mut remote_callbacks = RemoteCallbacks::new();
         remote_callbacks.credentials(|_, _, _| {
             println!("Attempting to authenticate");
-            return git2::Cred::userpass_plaintext(&bot_info.login, &config.api_token);
+            return git2::Cred::userpass_plaintext(&bot_info.login, &config.org_token);
         });
         
         remote_callbacks.push_update_reference(|_, opt| {
@@ -174,7 +174,7 @@ pub fn ensure_repo(config: &AppConfig, botinfo: &Author) -> Result<Repository, E
             });
             callback.credentials(|_, _, _| {
                 println!("Attempting to authenticate");
-                return git2::Cred::userpass_plaintext(&botinfo.login, &config.api_token);
+                return git2::Cred::userpass_plaintext(&botinfo.login, &config.org_token);
             });
             // Options relating to the fetch.
             let mut fetch_options = FetchOptions::new();
@@ -259,7 +259,7 @@ async fn setup_new_repo(config: &AppConfig, path: &String) -> Result<Repository,
     // Lots of .expects below this point, but I doubt any of them will happen in a typical situation.
 
     let octocrab = OctocrabBuilder::new()
-        .user_access_token(config.api_token.clone())
+        .user_access_token(config.bot_token.clone())
         .build() // This doesn't throw a libgit2 error, so if it fails uhhhhh break and let the person know they already have a fork??
         .expect("Was unable to prepare Octocrab, what did you do?? Is something wrong with your token?");
 
@@ -332,7 +332,7 @@ async fn setup_new_repo(config: &AppConfig, path: &String) -> Result<Repository,
     repo.remote(PR_REMOTE_NAME, &remote_url)?;
     repo.remote(COPY_REMOTE_NAME, &clone_url)?;
 
-    println!("Forked and cloned new repo");
+    println!("\nForked and cloned new repo");
 
     return Ok(repo);
 }

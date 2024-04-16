@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::Path;
 use std::fs;
 use std::thread::sleep;
@@ -6,6 +7,8 @@ use futures::executor::block_on;
 use git2::Repository;
 use git2::Error as GitError;
 use octocrab::models::Author;
+use octocrab::params::pulls::Sort;
+use octocrab::params::Direction;
 use octocrab::{self, models::pulls::PullRequest, params, Octocrab};
 use serde_yaml::{self};
 use chrono::{DateTime, Days, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -33,10 +36,13 @@ const FIRST_100_ONLY: bool = !true;
 const CHERRY_PICK_ONLY: [u64; 0] = [];
 
 // The template used to generate the YAML file when the application is first run.
-const YAML_TEMPLATE: &str = "
+const YAML_TEMPLATE: &str = "\
                                 ### NOTE THAT THIS FILE WILL BE ALTERED\n\n### The bot uses this file to store per-run data, and regenerates it every run.\n\
                                 ### The information you enter will be used and remembered, but do not rely on it being static.\n\n\
-                                ## Your GitHub API token\napi_token: token-here\n\
+                                # Yes, this bot requires two access tokens, one owned by the account and one owned by the organization.\n\
+                                # Yes, this blows. Talk to Github about it\n\
+                                ## The GitHub access token owned by the organization.\norg_token: token-here\n\
+                                ## The GitHub access token owned by the bot user account.\nbot_token: token-here\n\
                                 ## The repo we'll be cloning PRs from\nclone_repo:\n  ## The owner or org of the repository\n  owner: space-wizards\n  ## The name of the repository\n  name: space-station-14\n  ## The branch to check for PRs on\n  branch: master\n\
                                 ## The repo we'll be making our PR to\ninto_repo:\n  ## The owner or org of the repository to clone PRs into\n  owner: Simple-Station\n  ## The name of the repository to clone PRs into\n  name: Parkstation\n  ## The branch to clone PRs into\n  branch: master\n\
                                 ## The date to start checking for PRs from\n## Note that if this is too low, you'll get *every PR ever made*. This will be a lot of PRs. Format is YYYY-MM-DD\ndate_from: 2006-06-17\n\
@@ -44,7 +50,10 @@ const YAML_TEMPLATE: &str = "
                                 ## A list of labels to apply to PRs made by the bot\npr_labels: [ ]\n\
                                 ## A list of labels to apply to Issues made by the bot\nissue_labels: [ ]\n\
                                 ## A list of labels to ignore PRs with\n## If a PR has any of these labels, it won't be mirrored\nignored_labels: [ ]\n\
-                                ## A list of users to ignore PRs from\nignored_users: [ 'github-actions[bot]' ]
+                                ## A list of users to ignore PRs from\nignored_users: [ 'github-actions[bot]' ]\n\
+                                ## The PR number we will stop searching at. Once we've found this PR, we stop asking the GitHub API for more.\n## If this is empty, we'll get every PR every ever made and check their merge date.\n\
+                                ## Note that setting this to the last PR number you want *is not necessarily the best idea*, since a lower-number PR could be merged *after* a higher-number one.\n\
+                                ## This is to avoid gathering thousands of PRs you know you will never want.\nhard_cap: 0\
                             ";
 
 #[tokio::main]
@@ -55,11 +64,11 @@ async fn main() {
         let config = generate_config();
     
         let octocrab = octocrab::OctocrabBuilder::new()
-            .user_access_token(config.api_token.clone())
+            .user_access_token(config.org_token.clone())
             .build()
             .expect("Octocrab failed to build");
     
-        let bot_info = block_on(get_bot_info(&octocrab));
+        let bot_info = block_on(get_bot_info(&config));
 
         println!("'days_between' is set to 0, running once then exiting.");
         mirror_prs(&octocrab, &config, &bot_info).await; //? Completely circumvents the scheduling and file writing all together.
@@ -110,11 +119,11 @@ fn run_tasks() {
     let config = generate_config();
 
     let octocrab = octocrab::OctocrabBuilder::new()
-        .user_access_token(config.api_token.clone())
+        .user_access_token(config.org_token.clone())
         .build()
         .expect("Octocrab failed to build");
 
-    let bot_info = block_on(get_bot_info(&octocrab));
+    let bot_info = block_on(get_bot_info(&config));
     
     println!("Running scheduled tasks at {}.", Local::now().to_rfc2822());
     
@@ -156,7 +165,7 @@ async fn mirror_prs(octocrab: &Octocrab, config: &AppConfig, bot_info: &Author) 
     all_prs.sort_unstable_by_key(|pr| pr.merged_at);
 
     if all_prs.is_empty() {
-        println!("No PRs found since the cutoff date.");
+        println!("No valid PRs found.");
         return;
     }
 
@@ -172,7 +181,7 @@ async fn mirror_prs(octocrab: &Octocrab, config: &AppConfig, bot_info: &Author) 
 
     for merged_pr in all_prs.iter() {
         println!("Cherry-picking and pushing PR #{}.", merged_pr.number);
-        match cherry_pick_and_push_pr(&repo, merged_pr.clone(), &config, &bot_info) {
+        match cherry_pick_and_push_pr(&repo, &octocrab, merged_pr.clone(), &config, &bot_info) {
             Ok(_) => {
                 println!("Cherry-picked and pushed PR #{}.", merged_pr.number);
             },
@@ -191,7 +200,7 @@ async fn mirror_prs(octocrab: &Octocrab, config: &AppConfig, bot_info: &Author) 
     }
 }
 
-fn cherry_pick_and_push_pr(repo: &Repository, merged_pr: PullRequest, config: &AppConfig, bot_info: &Author) -> Result<(), GitError> {
+fn cherry_pick_and_push_pr(repo: &Repository, octocrab: &Octocrab, merged_pr: PullRequest, config: &AppConfig, bot_info: &Author) -> Result<(), GitError> {
     let sha = match merged_pr.merge_commit_sha.to_owned() {
         Some(s) => s,
         None => {
@@ -217,16 +226,12 @@ fn cherry_pick_and_push_pr(repo: &Repository, merged_pr: PullRequest, config: &A
     git_utils::push_to_remote(&repo, &config, &bot_info)?;
 
     println!("Making pull request for {}.", branch_name);
-    block_on(make_pull_request(&config, &bot_info, merged_pr, Some(sha), &branch_name));
+    block_on(make_pull_request(&config, &octocrab, &bot_info, merged_pr, Some(sha), &branch_name));
 
     return Ok(());
 }
 
-async fn make_pull_request(config: &AppConfig, bot_info: &Author, original_pr: PullRequest, merge_sha: Option<String>, branch: &str) {
-    let octocrab = octocrab::OctocrabBuilder::new()
-        .user_access_token(config.api_token.clone())
-        .build().expect("make_pull_request: Failed to build Octocrab");
-
+async fn make_pull_request(config: &AppConfig, octocrab: &Octocrab, bot_info: &Author, original_pr: PullRequest, merge_sha: Option<String>, branch: &str) {
     let merge_commit = match &merge_sha {
         Some(s) => {
             let commit = octocrab.commits(&config.clone_repo.owner, &config.clone_repo.name)
@@ -342,6 +347,8 @@ async fn get_all_prs(octocrab: &Octocrab, config: &AppConfig) -> Vec<PullRequest
     // Returns the first page of all prs.
     let mut page = match octocrab.pulls(&config.clone_repo.owner, &config.clone_repo.name)
         .list()
+        .sort(Sort::Created)
+        .direction(Direction::Descending)
         .base(&config.clone_repo.branch)
         .state(params::State::Closed)
         .per_page(100)
@@ -357,6 +364,8 @@ async fn get_all_prs(octocrab: &Octocrab, config: &AppConfig) -> Vec<PullRequest
             }
         };
 
+    // let mut page = octocrab.get_page(&Some(http::uri::Uri::from_static("https://api.github.com/repositories/197275551/pulls?state=closed&base=master&sort=created&direction=desc&per_page=100&page=50"))).await.unwrap().unwrap();
+
     // Start our collection.
     let mut all_prs = page.take_items();
 
@@ -367,13 +376,31 @@ async fn get_all_prs(octocrab: &Octocrab, config: &AppConfig) -> Vec<PullRequest
     }
 
     println!("Attempting to gather all PR data- this may take a while...");
-    all_prs.extend(match octocrab.all_pages(page).await {
-        Ok(p) => p,
-        Err(err) => {
-            eprintln!("Failed to get all pages- are you being rate limited?: {}", err);
-            return all_prs;
+    
+    let mut i = 1; //? First page done already
+    while page.next.is_some() {
+        page = match octocrab.get_page(&page.next.clone()).await {
+            Ok(p) => p.unwrap_or_else(|| panic!("Failed to get next page of PRs: No data returned.\nUnsure of how to continue.")),
+            Err(err) => {
+                eprintln!("Failed to get next page of PRs: {}", err);
+                eprintln!("Are you being rate limited?");
+                return all_prs;
+            }
+        };
+
+        all_prs.extend(page.take_items());
+        i = page.prev.unwrap().to_string().split("page=").last().unwrap().parse().unwrap();
+
+        if config.hard_cap.is_some() && all_prs.last().unwrap().number < config.hard_cap.unwrap() { //? The 'while' will never run if the list is empty.
+            println!("Hard cap reached, stopping at pr #{} on page #{}.", config.hard_cap.unwrap(), i);
+            break;
         }
-    });
+
+        print!("Done with page #{}, PR #{}...\r", i, all_prs.last().unwrap().number);
+        let _ = std::io::stdout().flush();
+    }
+
+    println!("Done gathering all PRs!");
 
     return all_prs;
 }
@@ -388,14 +415,14 @@ fn finalize(mut config: AppConfig) {
 
     // Write the new config to the file.
     let yaml_contents = serde_yaml::to_string(&config).unwrap();
-    write_to_config(yaml_contents);
+    write_to_config(yaml_contents, Some(&config));
 }
 
 fn generate_config() -> AppConfig {
     // Create the file if it doesn't exist.
     if !Path::new(FILE_NAME).exists() {
         println!("Config file does not exist, attempting to create it at {}/{}.", std::env::current_dir().expect("Couldn't find current dir! Are we lacking permissions?").to_str().unwrap_or_default(), FILE_NAME);
-        write_to_config(YAML_TEMPLATE.to_string());
+        write_to_config(YAML_TEMPLATE.to_string(), None);
         panic!("Config file {} created. Please fill in the necessary information and run the program again.", FILE_NAME);
     }
 
@@ -407,7 +434,7 @@ fn generate_config() -> AppConfig {
 
             //-- This timesout in case we're running in a non-interactive environment.
             //--  (timesout in 120 seconds)
-            // This just straight up doesn't work right now, but it doesn't break anything so I left it in.
+            //TODO: This just straight up doesn't work right now, but it doesn't break anything so I left it in.
             if block_on(timeout(Duration::from_secs(120), request_regenerate_config())).is_err() {
                 println!("Timed out waiting for user input.");
             }
@@ -417,13 +444,14 @@ fn generate_config() -> AppConfig {
     };
 }
 
-// fn get_bot_name() -> String { //TODO: Get the bot's info (email, etc.).
-//     // Api request to get the bot's name from the owned repo.
-//     let octocrab = octocrab::Octocrab::builder()
-// }
-
-async fn get_bot_info(octocrab: &Octocrab) -> Author {
-    let bot = octocrab.current().user().await;
+async fn get_bot_info(config: &AppConfig) -> Author {
+    let bot = Octocrab::builder()
+        .user_access_token(config.bot_token.clone())
+        .build()
+        .expect("Octocrab failed to build")
+        .current()
+        .user()
+        .await;
 
     if bot.is_err() {
         eprintln!("Couldn't obtain bot info: {}", bot.err().unwrap());
@@ -444,10 +472,10 @@ async fn request_regenerate_config() {
                 match std::io::stdin().read_line(&mut input) {
                     Ok(_) => {
                         if input.trim().to_lowercase() == "2" {
-                            write_to_config(serde_yaml::to_string(&AppConfig::default()).unwrap());
+                            write_to_config(serde_yaml::to_string(&AppConfig::default()).unwrap(), None);
                         }
                         else {
-                            write_to_config(YAML_TEMPLATE.to_string());
+                            write_to_config(YAML_TEMPLATE.to_string(), None);
                         }
                         panic!("Config file {} has been regenerated. Please fill in the necessary information and run the program again.", FILE_NAME);
                     },
@@ -466,16 +494,24 @@ async fn request_regenerate_config() {
     }
 }
 
-fn write_to_config(contents: String) {
+fn write_to_config(contents: String, config: Option<&AppConfig>) {
+    if let Some(c) = config {
+        if c.no_write.unwrap_or(false) {
+            println!("No-write flag is set, not overwriting config.");
+            println!("Contents would have been:\n{}", contents);
+            return;
+        }
+    }
+
     fs::write(FILE_NAME, contents).expect(&format!("Config file {} could not be created, or could not be written to.\nAre we missing permissions?.", FILE_NAME));
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct AppConfig {
-    api_token: String,
+    org_token: String,
+    bot_token: String,
     clone_repo: RepoInfo,
     into_repo: RepoInfo,
-    // owned_url: String,
     date_from: NaiveDate,
     days_between: u32,
     #[serde(default)]
@@ -489,8 +525,12 @@ pub struct AppConfig {
     #[serde(default)]
     prs_to_pull: Vec<u64>,
     time_offset: Option<NaiveTime>,
+    #[serde(default)]
+    hard_cap: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     debug: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    no_write: Option<bool>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Default, Clone)]
@@ -528,7 +568,8 @@ impl AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         return AppConfig {
-            api_token: String::default(),
+            org_token: String::default(),
+            bot_token: String::default(),
             clone_repo: RepoInfo {
                 owner: "space-wizards".to_string(),
                 name: "space-station-14".to_string(),
@@ -547,7 +588,9 @@ impl Default for AppConfig {
             ignored_users: Vec::new(),
             prs_to_pull: Vec::new(),
             time_offset: None,
+            hard_cap: None,
             debug: None,
+            no_write: None,
         };
     }
 }
