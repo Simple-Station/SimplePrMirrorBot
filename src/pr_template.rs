@@ -59,7 +59,7 @@ impl PrTemplate {
         if pr.html_url.is_some() {
             template.url_pr = pr.html_url.unwrap().as_str().to_string();
         }
-        
+
         if pr.diff_url.is_some() {
             template.url_diff = pr.diff_url.unwrap().as_str().to_string();
         }
@@ -98,24 +98,25 @@ impl PrTemplate {
 
             if repo.html_url.is_some() {
                 template.repo_link = repo.html_url.clone().unwrap().as_str().to_string();
-                
+
                 if repo.license.is_some() {
                     template.license = repo.license.clone().unwrap().name.clone();
                 }
             }
-    
+
             template.repo_name = repo.name.clone();
         }
 
         if merge_commit.is_some() {
             let commit = merge_commit.unwrap();
 
-            if let Some(user) = commit.committer { //TODO: Verify this is the correct person. Should be?
+            if let Some(user) = commit.committer {
+                //TODO: Verify this is the correct person. Should be?
                 template.merge_user_name = user.login.clone();
                 template.merge_user_link = user.html_url.as_str().to_string();
                 template.merge_user_icon = user.avatar_url.as_str().to_string();
             }
-            
+
             if let Some(files) = commit.files {
                 template.changed_files = files.len().to_string();
             }

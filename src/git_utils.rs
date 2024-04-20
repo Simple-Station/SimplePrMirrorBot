@@ -1,9 +1,9 @@
-use std::{cell::RefCell, io::{self, stdout, Write}, path::{Path, PathBuf}};
-use chrono::Local;
-use git2::{self, Progress, *, build::*}; // Progress needs to be explicitly imported here since it conflicts with one in 'build::'
-use octocrab::{models::Author, OctocrabBuilder};
-use tokio::task::block_in_place;
 use crate::AppConfig;
+use chrono::Local;
+use git2::{self, build::*, Progress, *}; // Progress needs to be explicitly imported here since it conflicts with one in 'build::'
+use octocrab::{models::Author, OctocrabBuilder};
+use std::{cell::RefCell, io::{self, stdout, Write}, path::{Path, PathBuf}};
+use tokio::task::block_in_place;
 
 const PR_REMOTE_NAME: &str = "upstream";
 const COPY_REMOTE_NAME: &str = "cloned";
@@ -16,7 +16,7 @@ pub fn push_to_remote(repo: &Repository, config: &AppConfig, bot_info: &Author) 
     }
 
     let mut remote = repo.find_remote(PUSH_REMOTE_NAME)?;
-    
+
     {
         let mut stdout = stdout().lock();
 
@@ -25,19 +25,19 @@ pub fn push_to_remote(repo: &Repository, config: &AppConfig, bot_info: &Author) 
             println!("Attempting to authenticate");
             return git2::Cred::userpass_plaintext(&bot_info.login, &config.org_token);
         });
-        
+
         remote_callbacks.push_update_reference(|_, opt| {
             if opt.is_some() {
                 return Err(Error::new(ErrorCode::Ambiguous, ErrorClass::Callback, format!("Failed to push! {:?}", opt)));
             }
             return Ok(());
         });
-        
+
         remote_callbacks.push_transfer_progress(|arg1, arg2, arg3| {
             print!("Pushing: {}/{}: {}\r", arg1, arg2, arg3);
             std::io::stdout().flush().unwrap();
         });
-        
+
         remote_callbacks.pack_progress(|arg1, arg2, arg3| {
             _ = write!(stdout, "Packing-{:?}: {}/{}\r", arg1, arg2, arg3);
             std::io::stdout().flush().unwrap();
@@ -45,11 +45,17 @@ pub fn push_to_remote(repo: &Repository, config: &AppConfig, bot_info: &Author) 
 
         let mut push_options = git2::PushOptions::new();
         push_options.remote_callbacks(remote_callbacks);
-    
-        remote.push(&[&format!("refs/heads/{}:refs/heads/{}", repo.head()?.shorthand().unwrap_or_default(), repo.head()?.shorthand().unwrap_or_default())], Some(&mut push_options))?;
+
+        remote.push(
+            &[&format!("refs/heads/{}:refs/heads/{}",
+                repo.head()?.shorthand().unwrap_or_default(),
+                repo.head()?.shorthand().unwrap_or_default())],
+            Some(&mut push_options),
+        )?;
     }
 
-    println!("Pushing to {} from {}", PUSH_REMOTE_NAME, format!("refs/heads/{}", repo.head()?.shorthand().unwrap_or_default()));
+    println!("Pushing to {} from refs/heads/{}",
+        PUSH_REMOTE_NAME, repo.head()?.shorthand().unwrap_or_default());
 
     return Ok(());
 }
@@ -67,10 +73,11 @@ pub fn cherry_pick_commit(repo: &Repository, config: &AppConfig, bot_info: &Auth
             let _ = stdout().flush();
             return true;
         });
-        
+
         // Options relating to the fetch.
         let mut fetch_options = FetchOptions::new();
-        fetch_options.update_fetchhead(true)
+        fetch_options
+            .update_fetchhead(true)
             // .depth(1)
             .remote_callbacks(fetch_callback);
 
@@ -84,31 +91,39 @@ pub fn cherry_pick_commit(repo: &Repository, config: &AppConfig, bot_info: &Auth
     repo.checkout_index(None, None)?;
 
     let mut merge_opts = git2::MergeOptions::new();
-    merge_opts.fail_on_conflict(false)
+    merge_opts
+        .fail_on_conflict(false)
         .find_renames(true)
         .standard_style(true)
         .file_favor(FileFavor::Theirs);
 
     let mut checkout_builder = CheckoutBuilder::new();
-    checkout_builder.force()
-        .allow_conflicts(true);
+    checkout_builder.force().allow_conflicts(true);
 
     let mut cherrypick_options = git2::CherrypickOptions::new();
-    cherrypick_options.checkout_builder(checkout_builder)
+    cherrypick_options
+        .checkout_builder(checkout_builder)
         .merge_opts(merge_opts);
 
     repo.cherrypick(&commit, Some(&mut cherrypick_options))?;
 
     // repo.merge(&[&commit], Some(&mut merge_opts), Some(&mut checkout_builder))?;
-    
+
     // Commit the changes.
     {
         let now = Local::now();
         let commit_time = Time::new(now.timestamp(), now.offset().local_minus_utc() / 60);
 
-        let auth_sig = Signature::new(&commit.author().name().unwrap_or("Unkown"), &commit.author().email().unwrap_or("Unkown"), &commit.time()).unwrap();
-        let commit_sig = Signature::new(&bot_info.login, &bot_info.email.to_owned().unwrap_or("Unknown".to_string()), &commit_time).unwrap();
-        let msg = format!("Cherry-picked commit {} from {}/{}/{}", sha, config.clone_repo.owner, config.clone_repo.name, config.clone_repo.branch);
+        let auth_sig = Signature::new(&commit.author().name().unwrap_or("Unkown"),
+            &commit.author().email().unwrap_or("Unkown"),
+            &commit.time(),)
+            .expect("Failed to create author signature");
+        let commit_sig = Signature::new(&bot_info.login,
+            &bot_info.email.to_owned().unwrap_or("Unknown".to_string()),
+            &commit_time,)
+            .expect("Failed to create committer signature");
+        let msg = format!("Cherry-picked commit {} from {}/{}/{}",
+            sha, config.clone_repo.owner, config.clone_repo.name, config.clone_repo.branch);
         let commit = repo.head()?.peel_to_commit()?;
         let tree = repo.find_tree(repo.index()?.write_tree()?)?;
         
@@ -147,13 +162,13 @@ pub fn ensure_repo(config: &AppConfig, botinfo: &Author) -> Result<Repository, E
         Ok(repo) => {
             println!("Opened existing repo");
             repo
-        },
+        }
         Err(_) => {
             println!("Failed to open existing repo at {}, attempting to create a new one", path);
             return block_in_place(|| setup_new_repo(&config, &path));
         }
     };
-    
+
     println!("Accessed repo at {}", path);
 
     let state = RefCell::new(State::default());
@@ -223,26 +238,26 @@ pub fn ensure_repo(config: &AppConfig, botinfo: &Author) -> Result<Repository, E
 
         repo.set_head(local_branch.name().unwrap())?;
     }
-    
+
     // Handles the progress of the checkout, and ensuring that the checkout occurs.
     let mut checkout_builder = CheckoutBuilder::new();
     checkout_builder
         .force()
         .overwrite_ignored(true)
         .progress(|path, cur, total| {
-        let mut state = state.borrow_mut();
-        state.path = path.map(|p| p.to_path_buf());
-        state.current = cur;
-        state.total = total;
-        print(&mut *state);
-    });
+            let mut state = state.borrow_mut();
+            state.path = path.map(|p| p.to_path_buf());
+            state.current = cur;
+            state.total = total;
+            print(&mut *state);
+        });
 
     repo.checkout_head(Some(&mut checkout_builder))?;
     println!("Checked out head");
 
     return Ok(repo);
 }
-    
+
 /// Creates a new repo with all requirements set up.
 #[tokio::main]
 async fn setup_new_repo(config: &AppConfig, path: &String) -> Result<Repository, Error> {
@@ -250,7 +265,7 @@ async fn setup_new_repo(config: &AppConfig, path: &String) -> Result<Repository,
     let remote_url = url_from_name(&upstream_repo_info.owner, &upstream_repo_info.name);
     let clone_url = url_from_name(&config.clone_repo.owner, &config.clone_repo.name);
     // let owned_url = &config.owned_url;
-    
+
     // Start by forking the upstream repo.
     //? I don't love dragging all the Octocrab stuff into this as I wanted to keep it localised to main,
     //? but this needs to happen upon the creation of a new repo, which main doesn't know anything about.
@@ -263,7 +278,8 @@ async fn setup_new_repo(config: &AppConfig, path: &String) -> Result<Repository,
         .build() // This doesn't throw a libgit2 error, so if it fails uhhhhh break and let the person know they already have a fork??
         .expect("Was unable to prepare Octocrab, what did you do?? Is something wrong with your token?");
 
-    let fork = octocrab.repos(&config.into_repo.owner, &config.into_repo.name)
+    let fork = octocrab
+        .repos(&config.into_repo.owner, &config.into_repo.name)
         .create_fork()
         .send()
         .await
@@ -272,7 +288,9 @@ async fn setup_new_repo(config: &AppConfig, path: &String) -> Result<Repository,
     let fork_url = match fork.clone_url {
         Some(url) => url,
         None => {
-            return Err(Error::new(ErrorCode::Ambiguous, ErrorClass::None, "Fork URL was not provided by GitHub"));
+            return Err(Error::new(ErrorCode::Ambiguous,
+                ErrorClass::None,
+                "Fork URL was not provided by GitHub"));
         }
     };
 
@@ -290,29 +308,27 @@ async fn setup_new_repo(config: &AppConfig, path: &String) -> Result<Repository,
         path: None,
         newline: false,
     });
-    
+
     // Handles the progress of the fetch.
     let mut fetch_callback = RemoteCallbacks::new();
     fetch_callback.transfer_progress(|stats| {
-            let mut state = state.borrow_mut();
-            state.progress = Some(stats.to_owned());
-            print(&mut *state);
-            let _ = stdout().flush();
-            return true;
-        });
-    
+        let mut state = state.borrow_mut();
+        state.progress = Some(stats.to_owned());
+        print(&mut *state);
+        let _ = stdout().flush();
+        return true;
+    });
+
     // Handles the progress of the checkout, and ensuring that the checkout occurs.
     let mut checkout_builder = CheckoutBuilder::new();
-    checkout_builder
-        .force()
-        .progress(|path, cur, total| {
+    checkout_builder.force().progress(|path, cur, total| {
         let mut state = state.borrow_mut();
         state.path = path.map(|p| p.to_path_buf());
         state.current = cur;
         state.total = total;
         print(&mut *state);
     });
-    
+
     // Options relating to the fetch.
     let mut fetch_options = FetchOptions::new();
     fetch_options
@@ -369,14 +385,14 @@ fn url_from_name(owner: &str, name: &str) -> String {
 fn print(state: &mut State) {
     let stats = state.progress.as_ref();
     if stats.is_none() {
-        print!(
-            "Receiving objects: {:4}/{:4} {}\r",
-            state.current, state.total, state
+        print!("Receiving objects: {:4}/{:4} {}\r",
+            state.current,
+            state.total,
+            state
                 .path
                 .as_ref()
                 .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        );
+                .unwrap_or_default());
         io::stdout().flush().unwrap();
         return;
     }

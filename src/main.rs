@@ -1,19 +1,10 @@
-use std::io::Write;
-use std::path::Path;
-use std::fs;
-use std::thread::sleep;
-use std::time::Duration;
-use futures::executor::block_on;
-use git2::Repository;
-use git2::Error as GitError;
-use octocrab::models::Author;
-use octocrab::params::pulls::Sort;
-use octocrab::params::Direction;
-use octocrab::{self, models::pulls::PullRequest, params, Octocrab};
-use serde_yaml::{self};
 use chrono::{DateTime, Days, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use clokwerk::Interval::{self};
-use clokwerk::{Job, Scheduler, TimeUnits};
+use clokwerk::{Interval, Job, Scheduler, TimeUnits};
+use futures::executor::block_on;
+use git2::{Error as GitError, Repository};
+use octocrab::{self, models::pulls::PullRequest, models::Author, params, params::pulls::Sort, params::Direction, Octocrab};
+use serde_yaml;
+use std::{fs, io::Write, path::Path, thread::sleep, time::Duration};
 use tokio::time::timeout;
 
 mod git_utils;
@@ -62,12 +53,12 @@ async fn main() {
 
     if config.days_between == 0 {
         let config = generate_config();
-    
+
         let octocrab = octocrab::OctocrabBuilder::new()
             .user_access_token(config.org_token.clone())
             .build()
             .expect("Octocrab failed to build");
-    
+
         let bot_info = block_on(get_bot_info(&config));
 
         println!("'days_between' is set to 0, running once then exiting.");
@@ -75,11 +66,16 @@ async fn main() {
         return;
     }
 
-    if config.date_from_with_time().and_utc() >= Utc::now() { //FIXME: This isn't comparing correctly I guess??
+    if config.date_from_with_time().and_utc() >= Utc::now() {
+        //FIXME: This isn't comparing correctly I guess??
         println!("'date_from' is set to a date in the future ({}), the mirror will first run {} days after that point.", config.date_from_with_time(), config.days_between);
         // Create a task that runs once at the configured date_from plus the days_between, then repeates every days_between thereafter.
         let cur_time = Utc::now();
-        let first_run = config.date_from_with_time().and_utc().checked_add_days(config.days_between_days()).expect("Are your dates and times valid?");
+        let first_run = config
+            .date_from_with_time()
+            .and_utc()
+            .checked_add_days(config.days_between_days())
+            .expect("Are your dates and times valid?");
         let until_first_run = (first_run - cur_time).num_days() as u32; // Fucking *needs* to be u32.
         let until_first_run_int = until_first_run.days();
 
@@ -87,9 +83,11 @@ async fn main() {
         println!("This program will now loop indefinitely. It should obviously be run in the background.");
 
         let mut prime_scheduler = Scheduler::with_tz(Utc);
-        prime_scheduler.every(until_first_run_int).once().run(move || loop_schedules(setup_tasks(config.clone())));
-    }
-    else {
+        prime_scheduler
+            .every(until_first_run_int)
+            .once()
+            .run(move || loop_schedules(setup_tasks(config.clone())));
+    } else {
         println!("Running mirror now and setting up repeating task to run every {} days.", config.days_between);
         println!("This program will now loop indefinitely. It should obviously be run in the background.");
 
@@ -98,7 +96,7 @@ async fn main() {
     }
 }
 
-fn loop_schedules(mut scheduler: Scheduler::<Utc>) {
+fn loop_schedules(mut scheduler: Scheduler<Utc>) {
     loop {
         scheduler.run_pending();
         // print!(".");
@@ -107,10 +105,12 @@ fn loop_schedules(mut scheduler: Scheduler::<Utc>) {
     }
 }
 
-fn setup_tasks(config: AppConfig) -> Scheduler::<Utc> {
+fn setup_tasks(config: AppConfig) -> Scheduler<Utc> {
     let mut scheduler = Scheduler::with_tz(Utc);
 
-    scheduler.every(config.days_between_interval()).run(run_tasks);
+    scheduler
+        .every(config.days_between_interval())
+        .run(run_tasks);
 
     return scheduler;
 }
@@ -124,9 +124,9 @@ fn run_tasks() {
         .expect("Octocrab failed to build");
 
     let bot_info = block_on(get_bot_info(&config));
-    
+
     println!("Running scheduled tasks at {}.", Local::now().to_rfc2822());
-    
+
     block_on(mirror_prs(&octocrab, &config, &bot_info));
 
     finalize(config);
@@ -145,7 +145,10 @@ async fn mirror_prs(octocrab: &Octocrab, config: &AppConfig, bot_info: &Author) 
         return;
     }
 
-    println!("Found {} PRs starting at {} and ending at {}.", &all_prs.len(), &all_prs.first().unwrap().number, &all_prs.last().unwrap().number);
+    println!("Found {} PRs starting at {} and ending at {}.",
+        &all_prs.len(),
+        &all_prs.first().unwrap().number,
+        &all_prs.last().unwrap().number);
 
     let date_time_cutoff: DateTime<Utc> = config.date_from_with_time().and_utc();
 
@@ -169,7 +172,10 @@ async fn mirror_prs(octocrab: &Octocrab, config: &AppConfig, bot_info: &Author) 
         return;
     }
 
-    println!("Filtered down to {} PRs starting at {} and ending at {}.", all_prs.len(), all_prs.first().unwrap().number, all_prs.last().unwrap().number);
+    println!("Filtered down to {} PRs starting at {} and ending at {}.",
+        all_prs.len(),
+        all_prs.first().unwrap().number,
+        all_prs.last().unwrap().number);
 
     let repo = match git_utils::ensure_repo(&config, &bot_info) {
         Ok(r) => r,
@@ -184,13 +190,13 @@ async fn mirror_prs(octocrab: &Octocrab, config: &AppConfig, bot_info: &Author) 
         match cherry_pick_and_push_pr(&repo, &octocrab, merged_pr.clone(), &config, &bot_info) {
             Ok(_) => {
                 println!("Cherry-picked and pushed PR #{}.", merged_pr.number);
-            },
+            }
             Err(e) => {
                 eprintln!("Failed to cherry-pick and push PR #{} {}: {}", merged_pr.number, merged_pr.title.clone().unwrap_or_default(), e);
                 make_issue(&config, &octocrab, merged_pr.clone(), e).await; // Report if something goes wrong.
             }
         }
-        
+
         if git_utils::reset_repo(&repo, &config).is_err() {
             eprintln!("Failed to reset repository after cherry-picking PR #{}.", merged_pr.number);
             return;
@@ -208,13 +214,12 @@ fn cherry_pick_and_push_pr(repo: &Repository, octocrab: &Octocrab, merged_pr: Pu
             return Err(GitError::from_str("No merge commit SHA."));
         }
     };
-    
+
     let branch_name = format!("{}_{}_{}_{}",
         &config.clone_repo.owner,
         &config.clone_repo.name,
         merged_pr.number,
-        Utc::now().date_naive()
-    );
+        Utc::now().date_naive());
 
     println!("Creating branch {}.", branch_name);
     git_utils::create_branch(&repo, &branch_name)?;
@@ -234,7 +239,8 @@ fn cherry_pick_and_push_pr(repo: &Repository, octocrab: &Octocrab, merged_pr: Pu
 async fn make_pull_request(config: &AppConfig, octocrab: &Octocrab, bot_info: &Author, original_pr: PullRequest, merge_sha: Option<String>, branch: &str) {
     let merge_commit = match &merge_sha {
         Some(s) => {
-            let commit = octocrab.commits(&config.clone_repo.owner, &config.clone_repo.name)
+            let commit = octocrab
+                .commits(&config.clone_repo.owner, &config.clone_repo.name)
                 .get(s)
                 .await;
 
@@ -251,8 +257,9 @@ async fn make_pull_request(config: &AppConfig, octocrab: &Octocrab, bot_info: &A
     let body = pr_template::PrTemplate::new(&original_pr, merge_commit).to_markdown();
     let base = config.into_repo.branch.clone();
 
-    if !NO_NET_ACTIVITY{
-        let pr_attempt = octocrab.pulls(&config.into_repo.owner, &config.into_repo.name)
+    if !NO_NET_ACTIVITY {
+        let pr_attempt = octocrab
+            .pulls(&config.into_repo.owner, &config.into_repo.name)
             .create(&title, &head, &base)
             .body(&body)
             // .draft(true)
@@ -262,14 +269,15 @@ async fn make_pull_request(config: &AppConfig, octocrab: &Octocrab, bot_info: &A
                 eprintln!("Failed to create pull request for {}: {}\nSha: {}", original_pr.number, e, merge_sha.unwrap_or_default());
                 eprintln!("This is probably a permissions issue.");
             });
-        
+
         if pr_attempt.is_ok() {
             let pr = pr_attempt.unwrap();
-            
-            let _ = octocrab.issues(&config.into_repo.owner, &config.into_repo.name)
-            .add_labels(pr.number, &config.pr_labels)
-            .await
-            .inspect_err(|e| eprintln!("Failed to add labels to PR #{}: {}", pr.number, e));
+
+            let _ = octocrab
+                .issues(&config.into_repo.owner, &config.into_repo.name)
+                .add_labels(pr.number, &config.pr_labels)
+                .await
+                .inspect_err(|e| eprintln!("Failed to add labels to PR #{}: {}", pr.number, e));
         }
     }
 
@@ -281,7 +289,8 @@ async fn make_pull_request(config: &AppConfig, octocrab: &Octocrab, bot_info: &A
 async fn make_issue(config: &AppConfig, octocrab: &Octocrab, pr: PullRequest, error: GitError) {
     let merge_commit = match pr.merge_commit_sha {
         Some(ref s) => {
-            let commit = octocrab.commits(&config.clone_repo.owner, &config.clone_repo.name)
+            let commit = octocrab
+                .commits(&config.clone_repo.owner, &config.clone_repo.name)
                 .get(s)
                 .await;
 
@@ -297,7 +306,8 @@ async fn make_issue(config: &AppConfig, octocrab: &Octocrab, pr: PullRequest, er
     let body = format!("## Failed to cherry-pick PR: {}\nPR body below\n\n{}", error, pr_template::PrTemplate::new(&pr, merge_commit).to_markdown());
 
     if !NO_NET_ACTIVITY {
-        let issue_handler = octocrab.issues(&config.into_repo.owner, &config.into_repo.name)
+        let issue_handler = octocrab
+            .issues(&config.into_repo.owner, &config.into_repo.name)
             .create(&title)
             .body(&body)
             // .assignees(assignees) //TODO: Automatic assignees?
@@ -305,12 +315,12 @@ async fn make_issue(config: &AppConfig, octocrab: &Octocrab, pr: PullRequest, er
             .send()
             .await;
 
-        if issue_handler.is_err() {        
+        if issue_handler.is_err() {
             eprintln!("Failed to create issue for missed PR #{}: {}", pr.number, issue_handler.err().unwrap());
             eprintln!("This is probably a permissions issue.");
         }
     }
-    
+
     if PRINT_PRS {
         println!("-------------\n{}\n{}\n-------------", title, &body);
     }
@@ -322,21 +332,23 @@ async fn get_all_prs(octocrab: &Octocrab, config: &AppConfig) -> Vec<PullRequest
         false => match !config.prs_to_pull.is_empty() {
             true => Some(config.prs_to_pull.clone()),
             false => None,
-        }
+        },
     };
 
     if forced_prs.is_some() {
         let mut prs = Vec::new();
         for num in CHERRY_PICK_ONLY.iter() {
-            let pr = match octocrab.pulls(&config.clone_repo.owner, &config.clone_repo.name)
+            let pr = match octocrab
+                .pulls(&config.clone_repo.owner, &config.clone_repo.name)
                 .get(*num)
-                .await {
-                    Ok(p) => p,
-                    Err(err) => {
-                        eprintln!("Failed to get PR by number {}: {}", num, err);
-                        continue;
-                    }
-                };
+                .await
+            {
+                Ok(p) => p,
+                Err(err) => {
+                    eprintln!("Failed to get PR by number {}: {}", num, err);
+                    continue;
+                }
+            };
 
             prs.push(pr);
         }
@@ -345,24 +357,24 @@ async fn get_all_prs(octocrab: &Octocrab, config: &AppConfig) -> Vec<PullRequest
     }
 
     // Returns the first page of all prs.
-    let mut page = match octocrab.pulls(&config.clone_repo.owner, &config.clone_repo.name)
+    let mut page = match octocrab
+        .pulls(&config.clone_repo.owner, &config.clone_repo.name)
         .list()
         .sort(Sort::Created)
         .direction(Direction::Descending)
         .base(&config.clone_repo.branch)
         .state(params::State::Closed)
         .per_page(100)
-        .send().await {
-            Ok(p) => p,
-            Err(err) => {
-                eprintln!("Failed to get first page of PRs for {}/{}: {}",
-                    config.clone_repo.owner,
-                    config.clone_repo.name,
-                    err
-                );
-                return Vec::new();
-            }
-        };
+        .send()
+        .await
+    {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("Failed to get first page of PRs for {}/{}: {}",
+                config.clone_repo.owner, config.clone_repo.name, err);
+            return Vec::new();
+        }
+    };
 
     // let mut page = octocrab.get_page(&Some(http::uri::Uri::from_static("https://api.github.com/repositories/197275551/pulls?state=closed&base=master&sort=created&direction=desc&per_page=100&page=50"))).await.unwrap().unwrap();
 
@@ -376,7 +388,7 @@ async fn get_all_prs(octocrab: &Octocrab, config: &AppConfig) -> Vec<PullRequest
     }
 
     println!("Attempting to gather all PR data- this may take a while...");
-    
+
     let mut i = 1; //? First page done already
     while page.next.is_some() {
         page = match octocrab.get_page(&page.next.clone()).await {
@@ -389,9 +401,18 @@ async fn get_all_prs(octocrab: &Octocrab, config: &AppConfig) -> Vec<PullRequest
         };
 
         all_prs.extend(page.take_items());
-        i = page.prev.unwrap().to_string().split("page=").last().unwrap().parse().unwrap();
+        i = page
+            .prev
+            .unwrap()
+            .to_string()
+            .split("page=")
+            .last()
+            .unwrap()
+            .parse()
+            .unwrap();
 
-        if config.hard_cap.is_some() && all_prs.last().unwrap().number < config.hard_cap.unwrap() { //? The 'while' will never run if the list is empty.
+        //? Unwrap is fine, the 'while' will never run if the list is empty.
+        if config.hard_cap.is_some() && all_prs.last().unwrap().number < config.hard_cap.unwrap() {
             println!("Hard cap reached, stopping at pr #{} on page #{}.", config.hard_cap.unwrap(), i);
             break;
         }
@@ -421,7 +442,12 @@ fn finalize(mut config: AppConfig) {
 fn generate_config() -> AppConfig {
     // Create the file if it doesn't exist.
     if !Path::new(FILE_NAME).exists() {
-        println!("Config file does not exist, attempting to create it at {}/{}.", std::env::current_dir().expect("Couldn't find current dir! Are we lacking permissions?").to_str().unwrap_or_default(), FILE_NAME);
+        println!("Config file does not exist, attempting to create it at {}/{}.",
+            std::env::current_dir()
+                .expect("Couldn't find current dir! Are we lacking permissions?")
+                .to_str()
+                .unwrap_or_default(),
+            FILE_NAME);
         write_to_config(YAML_TEMPLATE.to_string(), None);
         panic!("Config file {} created. Please fill in the necessary information and run the program again.", FILE_NAME);
     }
@@ -438,7 +464,7 @@ fn generate_config() -> AppConfig {
             if block_on(timeout(Duration::from_secs(120), request_regenerate_config())).is_err() {
                 println!("Timed out waiting for user input.");
             }
-                
+
             panic!();
         }
     };
@@ -473,21 +499,19 @@ async fn request_regenerate_config() {
                     Ok(_) => {
                         if input.trim().to_lowercase() == "2" {
                             write_to_config(serde_yaml::to_string(&AppConfig::default()).unwrap(), None);
-                        }
-                        else {
+                        } else {
                             write_to_config(YAML_TEMPLATE.to_string(), None);
                         }
                         panic!("Config file {} has been regenerated. Please fill in the necessary information and run the program again.", FILE_NAME);
-                    },
+                    }
                     Err(e) => {
                         panic!("Failed to read input: {}", e);
                     }
                 }
-            }
-            else {
+            } else {
                 panic!("Config file {} is invalid, and will not be regenerated.", FILE_NAME);
             }
-        },
+        }
         Err(e) => {
             panic!("Failed to read input: {}", e);
         }
@@ -542,7 +566,9 @@ pub struct RepoInfo {
 
 impl AppConfig {
     fn date_from_with_time(&self) -> NaiveDateTime {
-        return self.date_from.and_time(self.time_offset.unwrap_or(NaiveTime::default()));
+        return self
+            .date_from
+            .and_time(self.time_offset.unwrap_or(NaiveTime::default()));
     }
 
     fn days_between_interval(&self) -> Interval {
@@ -560,7 +586,7 @@ impl AppConfig {
             self.into_repo.owner,
             self.into_repo.name
         );
-    
+
         return path;
     }
 }
