@@ -23,7 +23,7 @@ pub fn push_to_remote(repo: &Repository, config: &AppConfig, bot_info: &Author) 
         let mut remote_callbacks = RemoteCallbacks::new();
         remote_callbacks.credentials(|_, _, _| {
             println!("Attempting to authenticate");
-            return git2::Cred::userpass_plaintext(&bot_info.login, &config.org_token);
+            return git2::Cred::userpass_plaintext(&bot_info.login, &config.bot_token);
         });
 
         remote_callbacks.push_update_reference(|_, opt| {
@@ -98,7 +98,10 @@ pub fn cherry_pick_commit(repo: &Repository, config: &AppConfig, bot_info: &Auth
         .file_favor(FileFavor::Theirs);
 
     let mut checkout_builder = CheckoutBuilder::new();
-    checkout_builder.force().allow_conflicts(true);
+    checkout_builder
+        .force()
+        .allow_conflicts(true)
+        .use_theirs(true);
 
     let mut cherrypick_options = git2::CherrypickOptions::new();
     cherrypick_options
@@ -114,14 +117,16 @@ pub fn cherry_pick_commit(repo: &Repository, config: &AppConfig, bot_info: &Auth
         let now = Local::now();
         let commit_time = Time::new(now.timestamp(), now.offset().local_minus_utc() / 60);
 
-        let auth_sig = Signature::new(&commit.author().name().unwrap_or("Unkown"),
+        let commit_sig = Signature::new(&commit.author().name().unwrap_or("Unkown"),
             &commit.author().email().unwrap_or("Unkown"),
             &commit.time(),)
             .expect("Failed to create author signature");
-        let commit_sig = Signature::new(&bot_info.login,
+
+        let auth_sig = Signature::new(&bot_info.login,
             &bot_info.email.to_owned().unwrap_or("Unknown".to_string()),
             &commit_time,)
             .expect("Failed to create committer signature");
+
         let msg = format!("Cherry-picked commit {} from {}/{}/{}",
             sha, config.clone_repo.owner, config.clone_repo.name, config.clone_repo.branch);
         let commit = repo.head()?.peel_to_commit()?;

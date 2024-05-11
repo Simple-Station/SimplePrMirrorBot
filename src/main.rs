@@ -42,8 +42,8 @@ const YAML_TEMPLATE: &str = "\
                                 ## A list of labels to apply to Issues made by the bot\nissue_labels: [ ]\n\
                                 ## A list of labels to ignore PRs with\n## If a PR has any of these labels, it won't be mirrored\nignored_labels: [ ]\n\
                                 ## A list of users to ignore PRs from\nignored_users: [ 'github-actions[bot]' ]\n\
-                                ## The PR number we will stop searching at. Once we've found this PR, we stop asking the GitHub API for more.\n## If this is empty, we'll get every PR every ever made and check their merge date.\n\
-                                ## Note that setting this to the last PR number you want *is not necessarily the best idea*, since a lower-number PR could be merged *after* a higher-number one.\n\
+                                ## The page number to stop collecting PRs at. This is in groups of 100, sorted by when they were created. \n## If this is empty, we'll get every PR every ever made and check their merge date.\n\
+                                ## Note that setting this to only get the first page or two *is not necessarily the best idea*, since an earlier-made PR could be merged *after* a later-made one, and thus missing them is possible.\n\
                                 ## This is to avoid gathering thousands of PRs you know you will never want.\nhard_cap: 0\
                             ";
 
@@ -262,7 +262,8 @@ async fn make_pull_request(config: &AppConfig, octocrab: &Octocrab, bot_info: &A
             .pulls(&config.into_repo.owner, &config.into_repo.name)
             .create(&title, &head, &base)
             .body(&body)
-            // .draft(true)
+            .draft(true)
+            .maintainer_can_modify(true)
             .send()
             .await
             .inspect_err(|e| {
@@ -376,8 +377,6 @@ async fn get_all_prs(octocrab: &Octocrab, config: &AppConfig) -> Vec<PullRequest
         }
     };
 
-    // let mut page = octocrab.get_page(&Some(http::uri::Uri::from_static("https://api.github.com/repositories/197275551/pulls?state=closed&base=master&sort=created&direction=desc&per_page=100&page=50"))).await.unwrap().unwrap();
-
     // Start our collection.
     let mut all_prs = page.take_items();
 
@@ -389,41 +388,82 @@ async fn get_all_prs(octocrab: &Octocrab, config: &AppConfig) -> Vec<PullRequest
 
     println!("Attempting to gather all PR data- this may take a while...");
 
-    let mut i = 1; //? First page done already
-    while page.next.is_some() {
-        page = match octocrab.get_page(&page.next.clone()).await {
-            Ok(p) => p.unwrap_or_else(|| panic!("Failed to get next page of PRs: No data returned.\nUnsure of how to continue.")),
-            Err(err) => {
-                eprintln!("Failed to get next page of PRs: {}", err);
-                eprintln!("Are you being rate limited?");
-                return all_prs;
-            }
-        };
+    // Determine how many pages there are, and how many times to call async.
+    let total_pages = page.number_of_pages().unwrap_or(1);
+    let total_pages = if let Some(hard_cap) = &config.hard_cap { hard_cap.min(&total_pages) } else { &total_pages };
+    let pages_per_thread = total_pages / &config.max_async.unwrap_or(2);
 
-        all_prs.extend(page.take_items());
-        i = page
-            .prev
-            .unwrap()
-            .to_string()
-            .split("page=")
-            .last()
-            .unwrap()
-            .parse()
-            .unwrap();
+    // Create a vector of futures to gather all PRs.
+    let mut futures = Vec::new();
+    let mut i = 2;
+    while &i <= total_pages {
+        let start = i;
+        let end = i + pages_per_thread;
+        i = end + 1;
 
-        //? Unwrap is fine, the 'while' will never run if the list is empty.
-        if config.hard_cap.is_some() && all_prs.last().unwrap().number < config.hard_cap.unwrap() {
-            println!("Hard cap reached, stopping at pr #{} on page #{}.", config.hard_cap.unwrap(), i);
-            break;
-        }
+        futures.push(get_prs_from_page_to(octocrab, config, start, end));
 
-        print!("Done with page #{}, PR #{}...\r", i, all_prs.last().unwrap().number);
         let _ = std::io::stdout().flush();
     }
+
+    // Gather all PRs.
+    all_prs.extend(futures::future::join_all(futures).await.into_iter().flatten());
+
+    // Remove duplicates.
+    all_prs.sort_unstable_by_key(|pr| pr.number);
+    all_prs.dedup_by(|a, b| a.number == b.number);
 
     println!("Done gathering all PRs!");
 
     return all_prs;
+}
+
+async fn get_prs_from_page_to(octocrab: &Octocrab, config: &AppConfig, page_start: u32, page_end: u32) -> Vec<PullRequest> {
+    let mut page = octocrab
+        .pulls(&config.clone_repo.owner, &config.clone_repo.name)
+        .list()
+        .sort(Sort::Created)
+        .direction(Direction::Descending)
+        .base(&config.clone_repo.branch)
+        .state(params::State::Closed)
+        .per_page(100)
+        .page(page_start)
+        .send()
+        .await
+        .inspect_err(|e| eprintln!("Failed to get page #{} of PRs: {}", page_start, e))
+        .unwrap();
+
+    let mut collection = vec![];
+    collection.extend(page.take_items());
+
+    let mut i = page_start + 1;
+    while page.next.is_some() && i <= page_end {
+        page = match octocrab.get_page(&page.next.clone()).await {
+            Ok(p) => p.unwrap_or_else(|| panic!("Failed to get next page of PRs: No data returned.\nUnsure of how to continue.")),
+            Err(err) => {
+                eprintln!("Failed to get next page of PRs: {}\nAre you being rate limited?", err);
+                return collection;
+            }
+        };
+
+        collection.extend(page.take_items());
+
+        print!("Done with page #{}, PR #{}...\r", i, collection.last().unwrap().number);
+        let _ = std::io::stdout().flush();
+
+        i += 1;
+        // i = page //TODO: This sucks :P
+        //     .prev
+        //     .unwrap()
+        //     .to_string()
+        //     .split("page=")
+        //     .last()
+        //     .unwrap()
+        //     .parse()
+        //     .unwrap();
+    }
+
+    return collection;
 }
 
 fn finalize(mut config: AppConfig) {
@@ -550,7 +590,9 @@ pub struct AppConfig {
     prs_to_pull: Vec<u64>,
     time_offset: Option<NaiveTime>,
     #[serde(default)]
-    hard_cap: Option<u64>,
+    hard_cap: Option<u32>,
+    #[serde(default)]
+    max_async: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     debug: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -615,6 +657,7 @@ impl Default for AppConfig {
             prs_to_pull: Vec::new(),
             time_offset: None,
             hard_cap: None,
+            max_async: None,
             debug: None,
             no_write: None,
         };

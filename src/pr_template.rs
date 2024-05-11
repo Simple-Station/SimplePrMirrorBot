@@ -138,8 +138,7 @@ impl PrTemplate {
             \n\
             ###### `{merge_sha}`\n\
             \n\
-            PR opened by <img src=\"{open_user_icon}\" width=\"16\"/><a href=\"{open_user_link}\"> {open_user_name}</a> at {open_date}\n\
-            PR merged by <img src=\"{merge_user_icon}\" width=\"16\"/><a href=\"{merge_user_link}\"> {merge_user_name}</a> at {merge_date}\n\
+            PR opened by <img src=\"{open_user_icon}\" width=\"16\"/><a href=\"{open_user_link}\"> {open_user_name}</a> at {open_date} - merged at {merge_date}\n\
             \n\
             ---\n\
             \n\
@@ -168,10 +167,12 @@ impl PrTemplate {
             open_user_name=self.open_user_name,
             open_user_link=self.open_user_link,
             open_date=self.open_date,
-            merge_user_icon=self.merge_user_icon,
-            merge_user_name=self.merge_user_name,
-            merge_user_link=self.merge_user_link,
+            //-- merge_user_icon=self.merge_user_icon,
+            //-- merge_user_name=self.merge_user_name,
+            //-- merge_user_link=self.merge_user_link,
             merge_date=self.merge_date,
+            //-- PR merged by <img src=\"{merge_user_icon}\" width=\"16\"/><a href=\"{merge_user_link}\"> {merge_user_name}</a> at {merge_date}\n\
+            // Turns out the 'author' of the PR is always GitHub webflow... :T
             merge_sha=self.merge_sha,
             original_desc=self.original_desc.split("\n").into_iter().map(|l| format!("> {}\n", l)).collect::<String>(),
             labels_list=self.labels.iter().map(|l| format!("- {}\n", l)).collect::<String>(),
