@@ -2,7 +2,7 @@ use chrono::{DateTime, Days, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use clokwerk::{Interval, Job, Scheduler, TimeUnits};
 use futures::executor::block_on;
 use git2::{Error as GitError, Repository};
-use octocrab::{self, models::pulls::PullRequest, models::Author, params, params::pulls::Sort, params::Direction, Octocrab};
+use octocrab::{self, models::pulls::PullRequest, models::Author, params, params::pulls::Sort, params::Direction, Octocrab, Error as OctoError};
 use serde_yaml;
 use std::{fs, io::Write, path::Path, thread::sleep, time::Duration};
 use tokio::time::timeout;
@@ -17,12 +17,11 @@ const FILE_NAME: &str = "simple_mirror_config.yml";
 
 // Debug vars
 /// Prevents any lasting net activity, such as pushing to branches, and opening PRs.
-/// Prints potential PRs and issues to the console instead.
-pub const NO_NET_ACTIVITY: bool = !true;
+pub const NO_NET_ACTIVITY: bool = true;
 /// Prints finished PRs and issues to the console. Most useful when NO_NET_ACTIVITY is not false.
-const PRINT_PRS: bool = !true;
+const PRINT_PRS: bool = true;
 /// Only gathers and iterates over the first 100 PRs. Generally much faster.
-const FIRST_100_ONLY: bool = !true;
+const FIRST_100_ONLY: bool = true;
 /// If this list is populated with pr numbers, the program will only cherry-pick and push those PRs instead of fetching any.
 const CHERRY_PICK_ONLY: [u64; 0] = [];
 
@@ -206,12 +205,12 @@ async fn mirror_prs(octocrab: &Octocrab, config: &AppConfig, bot_info: &Author) 
     }
 }
 
-fn cherry_pick_and_push_pr(repo: &Repository, octocrab: &Octocrab, merged_pr: PullRequest, config: &AppConfig, bot_info: &Author) -> Result<(), GitError> {
+fn cherry_pick_and_push_pr(repo: &Repository, octocrab: &Octocrab, merged_pr: PullRequest, config: &AppConfig, bot_info: &Author) -> Result<(), Error> {
     let sha = match merged_pr.merge_commit_sha.to_owned() {
         Some(s) => s,
         None => {
             eprintln!("PR #{} has no merge commit SHA.", merged_pr.number);
-            return Err(GitError::from_str("No merge commit SHA."));
+            return Err(Error::General("Octocrab returned PR with no sha".to_string()));
         }
     };
 
@@ -231,12 +230,12 @@ fn cherry_pick_and_push_pr(repo: &Repository, octocrab: &Octocrab, merged_pr: Pu
     git_utils::push_to_remote(&repo, &config, &bot_info)?;
 
     println!("Making pull request for {}.", branch_name);
-    block_on(make_pull_request(&config, &octocrab, &bot_info, merged_pr, Some(sha), &branch_name));
+    block_on(make_pull_request(&config, &octocrab, &bot_info, merged_pr, Some(sha), &branch_name))?;
 
     return Ok(());
 }
 
-async fn make_pull_request(config: &AppConfig, octocrab: &Octocrab, bot_info: &Author, original_pr: PullRequest, merge_sha: Option<String>, branch: &str) {
+async fn make_pull_request(config: &AppConfig, octocrab: &Octocrab, bot_info: &Author, original_pr: PullRequest, merge_sha: Option<String>, branch: &str) -> Result<(), Error> {
     let merge_commit = match &merge_sha {
         Some(s) => {
             let commit = octocrab
@@ -252,42 +251,67 @@ async fn make_pull_request(config: &AppConfig, octocrab: &Octocrab, bot_info: &A
         None => None,
     };
 
-    let title = format!("Mirror: {}", original_pr.title.clone().unwrap_or_default());
+    let filled_template = pr_template::PrTemplate::new(&original_pr, merge_commit);
     let head = format!("{}:{}", &bot_info.login, branch);
-    let body = pr_template::PrTemplate::new(&original_pr, merge_commit).to_markdown();
     let base = config.into_repo.branch.clone();
 
-    if !NO_NET_ACTIVITY {
-        let pr_attempt = octocrab
-            .pulls(&config.into_repo.owner, &config.into_repo.name)
-            .create(&title, &head, &base)
-            .body(&body)
-            .draft(true)
-            .maintainer_can_modify(true)
-            .send()
-            .await
-            .inspect_err(|e| {
+    if NO_NET_ACTIVITY {
+        if PRINT_PRS {
+            println!("\n-------------\n{}\n{}\n-------------\n", filled_template.get_title(), filled_template.get_body());
+        }
+    
+        return Ok(());
+    }
+
+    let pr_attempt = match timeout(Duration::from_secs(10), send_pull_request(octocrab, config, &filled_template.get_title(), &head, &base, &filled_template.get_body())).await {
+        Ok(p) => {
+            p.inspect_err(|e| {
                 eprintln!("Failed to create pull request for {}: {}\nSha: {}", original_pr.number, e, merge_sha.unwrap_or_default());
                 eprintln!("This is probably a permissions issue.");
-            });
-
-        if pr_attempt.is_ok() {
-            let pr = pr_attempt.unwrap();
-
-            let _ = octocrab
-                .issues(&config.into_repo.owner, &config.into_repo.name)
-                .add_labels(pr.number, &config.pr_labels)
-                .await
-                .inspect_err(|e| eprintln!("Failed to add labels to PR #{}: {}", pr.number, e));
+            })
+        },
+        Err(_) => {
+            eprintln!("Timed out creating pull request for PR #{}.\nBot will sit idle for one minute before attempting again.", original_pr.number);
+            sleep(Duration::from_secs(60));
+            
+            match timeout(Duration::from_secs(10), send_pull_request(octocrab, config, &filled_template.get_title(), &head, &base, &filled_template.get_body())).await {
+                Ok(p) => p.inspect_err(|e| {
+                    eprintln!("Failed to create pull request for {}: {}\nSha: {}", original_pr.number, e, merge_sha.unwrap_or_default());
+                    eprintln!("This is probably a permissions issue.");
+                }),
+                Err(_) => {
+                    eprintln!("Failed to create pull request for PR #{} after two attempts. Giving up.", original_pr.number);
+                    return Err(Error::General("Failed to create pull request after two attempts.".to_string()));
+                }
+            }
         }
-    }
+    };
 
-    if PRINT_PRS {
-        println!("-------------\n{}\n{}\n-------------", title, &body);
-    }
+    if pr_attempt.is_ok() {
+        let pr = pr_attempt.unwrap();
+
+        let _ = octocrab
+            .issues(&config.into_repo.owner, &config.into_repo.name)
+            .add_labels(pr.number, &config.pr_labels)
+            .await
+            .inspect_err(|e| eprintln!("Failed to add labels to PR #{}: {}", pr.number, e));
+    };
+
+    return Ok(());
 }
 
-async fn make_issue(config: &AppConfig, octocrab: &Octocrab, pr: PullRequest, error: GitError) {
+async fn send_pull_request(octocrab: &Octocrab, config: &AppConfig, title: &String, head: &String, base: &String, body: &String) -> Result<PullRequest, OctoError> {
+    return octocrab
+        .pulls(&config.into_repo.owner, &config.into_repo.name)
+        .create(title, head, base)
+        .body(body)
+        .draft(true)
+        .maintainer_can_modify(true)
+        .send()
+        .await;
+}
+
+async fn make_issue(config: &AppConfig, octocrab: &Octocrab, pr: PullRequest, error: Error) {
     let merge_commit = match pr.merge_commit_sha {
         Some(ref s) => {
             let commit = octocrab
@@ -304,7 +328,7 @@ async fn make_issue(config: &AppConfig, octocrab: &Octocrab, pr: PullRequest, er
     };
 
     let title = format!("Failed to cherry-pick PR #{}: {}", pr.number, pr.title.clone().unwrap_or_default());
-    let body = format!("## Failed to cherry-pick PR: {}\nPR body below\n\n{}", error, pr_template::PrTemplate::new(&pr, merge_commit).to_markdown());
+    let body = format!("## Failed to cherry-pick PR: {}\nPR body below\n\n{}", error, pr_template::PrTemplate::new(&pr, merge_commit).get_body());
 
     if !NO_NET_ACTIVITY {
         let issue_handler = octocrab
@@ -661,5 +685,46 @@ impl Default for AppConfig {
             debug: None,
             no_write: None,
         };
+    }
+}
+
+#[derive(Debug)]
+enum Error {
+    Octocrab(OctoError),
+    Git(GitError),
+    General(String),
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            Error::Octocrab(e) => write!(f, "Octocrab error: {}", e),
+            Error::Git(e) => write!(f, "Git error: {}", e),
+            Error::General(e) => write!(f, "General error: {}", e),
+        }
+    }
+}
+
+impl From<OctoError> for Error {
+    fn from(e: OctoError) -> Self {
+        return Error::Octocrab(e);
+    }
+}
+
+impl From<GitError> for Error {
+    fn from(e: GitError) -> Self {
+        return Error::Git(e);
+    }
+}
+
+impl From<String> for Error {
+    fn from(e: String) -> Self {
+        return Error::General(e);
+    }
+}
+
+impl From<&str> for Error {
+    fn from(e: &str) -> Self {
+        return Error::General(e.to_string());
     }
 }

@@ -1,6 +1,6 @@
-use crate::AppConfig;
+use crate::{Error, AppConfig};
 use chrono::Local;
-use git2::{self, build::*, Progress, *}; // Progress needs to be explicitly imported here since it conflicts with one in 'build::'
+use git2::{Error as GitError, self, build::*, Progress, *}; // Progress needs to be explicitly imported here since it conflicts with one in 'build::'
 use octocrab::{models::Author, OctocrabBuilder};
 use std::{cell::RefCell, io::{self, stdout, Write}, path::{Path, PathBuf}};
 use tokio::task::block_in_place;
@@ -28,7 +28,8 @@ pub fn push_to_remote(repo: &Repository, config: &AppConfig, bot_info: &Author) 
 
         remote_callbacks.push_update_reference(|_, opt| {
             if opt.is_some() {
-                return Err(Error::new(ErrorCode::Ambiguous, ErrorClass::Callback, format!("Failed to push! {:?}", opt)));
+                // I don't know why I'm fabricating an error here or why it's needed...
+                return Err(GitError::new(ErrorCode::Ambiguous, ErrorClass::Callback, format!("Failed to push! {:?}", opt)));
             }
             return Ok(());
         });
@@ -280,22 +281,18 @@ async fn setup_new_repo(config: &AppConfig, path: &String) -> Result<Repository,
 
     let octocrab = OctocrabBuilder::new()
         .user_access_token(config.bot_token.clone())
-        .build() // This doesn't throw a libgit2 error, so if it fails uhhhhh break and let the person know they already have a fork??
-        .expect("Was unable to prepare Octocrab, what did you do?? Is something wrong with your token?");
+        .build()?;
 
     let fork = octocrab
         .repos(&config.into_repo.owner, &config.into_repo.name)
         .create_fork()
         .send()
-        .await
-        .expect("Was unable to make a fork of the repo! Are you sure the original Repo exists?");
+        .await?;
 
     let fork_url = match fork.clone_url {
         Some(url) => url,
         None => {
-            return Err(Error::new(ErrorCode::Ambiguous,
-                ErrorClass::None,
-                "Fork URL was not provided by GitHub"));
+            return Err(Error::from("Fork URL was not provided by GitHub"))
         }
     };
 
@@ -372,10 +369,8 @@ pub fn reset_repo(repo: &Repository, config: &AppConfig) -> Result<(), Error> {
             continue;
         }
 
-        let name = branch.name()?.unwrap().to_string();
-
         if branch.delete().is_err() {
-            println!("Failed to delete branch {}", name);
+            eprintln!("Failed to delete branch {}", branch.name()?.unwrap_or_default());
         }
     }
 

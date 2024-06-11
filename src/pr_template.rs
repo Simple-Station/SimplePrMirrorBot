@@ -132,7 +132,11 @@ impl PrTemplate {
         return template;
     }
 
-    pub fn to_markdown(&self) -> String {
+    pub fn get_title(&self) -> String {
+        return format!("Mirror {}: {}", self.number, self.title);
+    }
+
+    pub fn get_body(&self) -> String {
         return format!(
             "## Mirror of  PR #{number}: [{title}]({url_pr}) from <img src=\"{owner_icon}\" alt=\"{owner_name}\" width=\"22\"/> [{owner_name}]({owner_link})/[{repo_name}]({repo_link})\n\
             \n\
