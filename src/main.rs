@@ -17,11 +17,11 @@ const FILE_NAME: &str = "simple_mirror_config.yml";
 
 // Debug vars
 /// Prevents any lasting net activity, such as pushing to branches, and opening PRs.
-pub const NO_NET_ACTIVITY: bool = true;
+pub const NO_NET_ACTIVITY: bool = !true;
 /// Prints finished PRs and issues to the console. Most useful when NO_NET_ACTIVITY is not false.
-const PRINT_PRS: bool = true;
+const PRINT_PRS: bool = !true;
 /// Only gathers and iterates over the first 100 PRs. Generally much faster.
-const FIRST_100_ONLY: bool = true;
+const FIRST_100_ONLY: bool = !true;
 /// If this list is populated with pr numbers, the program will only cherry-pick and push those PRs instead of fetching any.
 const CHERRY_PICK_ONLY: [u64; 0] = [];
 
